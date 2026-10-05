@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -49,14 +50,15 @@ class ArticleSentiment(BaseModel):
 
 
 class Brief(BaseModel):
+    # Grouping comes first so the developments below can follow it (one item per story)
+    article_sentiment: List[ArticleSentiment] = Field(description="One entry per article provided.")
+    story_groups: List[List[int]] = Field(description="Groups of article IDs that report the same specific news item: the same announcement, the same analyst note, the same comments by the same person. Articles that only share a theme (e.g. two different iPhone stories) are NOT the same story. Only groups of 2 or more; each ID in at most one group. When in doubt, don't group.")
     company_description: str = Field(description="One plain sentence a beginner understands: what the company does and how it makes money. No jargon.")
     tldr: str = Field(description="One or two plain sentences summing up the current situation for a beginner investor.")
     developments: List[Development] = Field(description="Up to 5 most important recent events, most impactful first. Fewer (even zero) is fine when there is little real news.")
     bull_case: List[Point] = Field(description="2-3 specific reasons the stock could go up.")
     bear_case: List[Point] = Field(description="2-3 specific risks for this company. No generic market risks.")
     watch: List[str] = Field(description="2-4 upcoming catalysts or open questions to watch, with dates when known.")
-    article_sentiment: List[ArticleSentiment] = Field(description="One entry per article provided.")
-    story_groups: List[List[int]] = Field(description="Groups of article IDs that report the same specific news item: the same announcement, the same analyst note, the same comments by the same person. Articles that only share a theme (e.g. two different iPhone stories) are NOT the same story. Only groups of 2 or more; each ID in at most one group. When in doubt, don't group.")
     sentiment_summary: str = Field(description="One sentence on the tone of the news, and whether it agrees with the analyst consensus.")
 
 
@@ -447,6 +449,15 @@ def consensus_agent(state: AgentState) -> AgentState:
     except Exception as e:
         print(f"[Consensus Agent] No insider data: {e}")
 
+    volatility_pct = None
+    try:
+        closes = stock.history(period="1y", interval="1d")["Close"].dropna()
+        returns = (closes / closes.shift(1)).dropna().apply(math.log)
+        if len(returns) > 100:
+            volatility_pct = _num(float(returns.std()) * math.sqrt(252) * 100, 0)  # typical yearly swing
+    except Exception as e:
+        print(f"[Consensus Agent] No volatility: {e}")
+
     valuation_history = None
     try:
         valuation_history = _valuation_history(stock, price / 100 if price and info.get("currency") == "GBp" else price,
@@ -524,6 +535,8 @@ def consensus_agent(state: AgentState) -> AgentState:
         "shareholder_returns": shareholder_returns,
         "insiders": insiders,
         "valuation_history": valuation_history,
+        "volatility_pct": volatility_pct,
+        "listed_in_us": "." not in ticker,
     }
     print(f"[Consensus Agent] Got data: {stock_info['recommendation']} from {stock_info['analyst_count']} analysts")
     return {"stock_info": stock_info}
@@ -556,6 +569,14 @@ def _peer_candidates_finnhub(ticker: str) -> List[str]:
 
 
 def _peer_candidates_llm(ticker: str, name: str, sector: Optional[str], description: str, suggested: List[str]) -> List[str]:
+    if "." in ticker:
+        # A European company's real rivals are often European and not US-listed (Fortum -> RWE, Verbund, not Vistra)
+        peer_listing_rule = (
+            "Pick the true competitors wherever they are listed. Use Yahoo Finance tickers for their main listing, "
+            "with the exchange suffix (e.g. RWE.DE, VER.VI, ORSTED.CO, UPM.HE, VOLV-B.ST), or the plain ticker for US companies. "
+        )
+    else:
+        peer_listing_rule = "They must trade in the US: use the US ticker, or the US ADR ticker for foreign companies (e.g. TM for Toyota). "
     review = (
         f"An industry database suggests these peers: {', '.join(suggested)}. Databases often group companies by "
         "a broad industry code, so some may not really compete. Keep the ones that do, drop the ones that don't, "
@@ -568,7 +589,7 @@ def _peer_candidates_llm(ticker: str, name: str, sector: Optional[str], descript
             f"What it does: {description[:600] or 'unknown'}\n\n"
             f"{review}"
             "Return the 6 closest direct competitors that an investor would compare it with, most relevant first. "
-            "They must trade in the US: use the US ticker, or the US ADR ticker for foreign companies (e.g. TM for Toyota). "
+            f"{peer_listing_rule}"
             "Return ticker symbols only."
         ))])
         return result.tickers
@@ -590,7 +611,7 @@ def _peer_metrics(ticker: str) -> Optional[dict]:
     return {
         "ticker": ticker,
         "market_cap_usd": info["marketCap"] * rate if rate else None,
-        "name": info.get("shortName") or info.get("longName") or ticker,
+        "name": info.get("longName") or info.get("shortName") or ticker,
         "market_cap": info.get("marketCap"),
         "change_1y_pct": pct(info.get("52WeekChange")),
         "trailing_pe": _num(info.get("trailingPE"), 1),
@@ -688,8 +709,10 @@ RECENT ARTICLES (cite by ID):
 {article_list}
 
 Rules:
-- Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles, long-range price predictions and routine daily price moves (e.g. "shares indicated lower pre-market"). Combine several analyst target changes into at most one item. Never pad the list: if there are few real events, list fewer and say in the TL;DR that recent news is thin.
+- Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles, long-range price predictions and routine daily price moves (e.g. "shares indicated lower pre-market"). Combine several analyst target changes into at most one item. One item per story: everything about the same deal or event (e.g. a takeover's acceptance level and its offer extension) goes into a single item citing all relevant IDs. Never pad the list: if there are few real events, list fewer and say in the TL;DR that recent news is thin.
 - Articles may be in other languages. Always write in English.
+- Keep facts exact, but write natural English sentences rather than copying awkward headline phrasing (e.g. "a Fortum subsidiary extended the offer", not "Fortum extended the offer through a unit").
+- Write dates like "Oct 28", never "2026-10-28".
 - Amounts are in {s['currency']} (prices) and {s['financial_currency']} (financials). Use the right currency, never assume dollars.
 - Every development must cite at least one article ID. Never cite an ID that is not in the list.
 - Bull and bear points must be specific to this company. Do not write generic risks like "market volatility" or "economic uncertainty". Prefer points supported by the articles; if a point comes from the financial data above or general background knowledge, leave source_ids empty.

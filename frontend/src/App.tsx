@@ -38,6 +38,8 @@ interface Stock {
   links: Record<"income_statement" | "balance_sheet" | "cash_flow" | "sec_filings" | "company_website", string | null>;
   shareholder_returns: { buybacks: number; dividends: number; yield_pct: number | null } | null;
   insiders: Insiders | null;
+  volatility_pct: number | null;
+  listed_in_us: boolean;
   valuation_history: ValuationHistory | null;
 }
 
@@ -213,6 +215,8 @@ const EXPLAIN: Record<string, string> = {
     "Trades by the company's own executives and directors over the last 6 months (open-market only; stock grants are left out). Executives often sell for routine reasons like taxes or diversification, so selling is common. Buying with their own money is rarer and usually a stronger signal.",
   peHistory:
     "Compares today's P/E with the stock's own past. A company that is usually valued highly isn't necessarily expensive today; one that is far above its usual level means investors are more optimistic than normal, which leaves less room for disappointment.",
+  volatility:
+    "How much the price typically moves up or down over a year, based on the last 12 months of daily prices. A broad stock index usually swings around ±15–20%; single stocks usually more.",
   beta:
     "How much the stock tends to move compared with the overall market. 1 = same as the market, 2 = about twice as much up and down.",
   earningsHistory:
@@ -269,7 +273,7 @@ const targetContext = (s: Stock) => {
   return spread > 0.6 ? "Analysts disagree a lot" : spread < 0.25 ? "Analysts broadly agree" : null;
 };
 
-const healthItems = (f: Financials, returns: Stock["shareholder_returns"], cur: string) => {
+const healthItems = (f: Financials, returns: Stock["shareholder_returns"], cur: string, volatility: number | null, listedInUs: boolean) => {
   const sym = currencySymbol(cur);
   const items: { label: string; value: string; note: string; verdict: Verdict; info: string }[] = [];
   if (f.revenue_growth_pct != null) {
@@ -362,18 +366,33 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"], cur: 
         : "neutral",
     info: EXPLAIN.dividend,
   });
-  if (f.beta != null) {
+  const swing = volatility != null ? ` Typically swings about ±${volatility}% in a year.` : "";
+  if (listedInUs && f.beta != null) {
     items.push({
       label: "Volatility",
       value: `Beta ${f.beta.toFixed(2)}`,
       note:
-        f.beta > 1.3
-          ? `Moves about ${f.beta.toFixed(1)}× as much as the market — bigger swings`
+        (f.beta > 1.3
+          ? `Moves about ${f.beta.toFixed(1)}× as much as the market — bigger swings.`
           : f.beta < 0.7
-          ? "Moves less than the market — calmer"
-          : "Moves roughly with the market",
+          ? "Moves less than the market — calmer."
+          : "Moves roughly with the market.") + swing,
       verdict: "neutral",
       info: EXPLAIN.beta,
+    });
+  } else if (volatility != null) {
+    // Yahoo's beta is measured against the US market, which says little about a Helsinki or Frankfurt stock
+    items.push({
+      label: "Volatility",
+      value: `±${volatility}% / yr`,
+      note:
+        volatility < 20
+          ? "Calmer than most individual stocks"
+          : volatility <= 35
+          ? "Typical swings for an individual stock"
+          : "Bigger swings than most stocks",
+      verdict: "neutral",
+      info: EXPLAIN.volatility,
     });
   }
   return items;
@@ -515,6 +534,12 @@ const comparablePe = (s: Stock) => {
   return Math.abs(v.current - s.trailing_pe) / s.trailing_pe <= 0.2;
 };
 
+const rangePosition = (v: ValuationHistory) => {
+  if (v.current == null || v.high <= v.low) return null;
+  const pos = (v.current - v.low) / (v.high - v.low);
+  return pos >= 0.85 ? "near the top of its 5-year range" : pos <= 0.15 ? "near the bottom of its 5-year range" : null;
+};
+
 const isCyclical = (v: ValuationHistory) => v.low > 0 && v.high / v.low > 4;
 
 const historyVerdict = (v: ValuationHistory) => {
@@ -544,12 +569,14 @@ function ValuationCard({ name, v }: { name: string; v: ValuationHistory }) {
       </div>
       <p className="valuation-headline">
         {verdict && <strong>{verdict} for {shortName}.</strong>} P/E is <strong>{v.current ?? "—"}</strong> now vs. a
-        5-year average of <strong>{v.average}</strong> (range {v.low}–{v.high}).
+        5-year average of <strong>{v.average}</strong> (range {v.low}–{v.high})
+        {rangePosition(v) ? `, ${rangePosition(v)}` : ""}.
       </p>
       {isCyclical(v) && (
         <p className="notice">
-          <strong>P/E swings a lot for {shortName}</strong> ({v.low} to {v.high}). This is typical for cyclical
-          businesses, where profits rise and fall with the economy, so the average is only a rough guide.
+          <strong>P/E has swung a lot for {shortName}</strong> ({v.low} to {v.high}) because its profits have moved a
+          lot, for example with the economy, commodity or energy prices, or one-off events. Treat the average as a rough
+          guide.
         </p>
       )}
       <svg className="valuation-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img"
@@ -1008,9 +1035,12 @@ export default function App() {
               {s.upside_pct != null && s.upside_pct < 0 && s.target_mean != null && (
                 <div className="notice">
                   <strong>Already above the analysts' target.</strong> The price ({money(s.price, s.currency)}) has passed the average
-                  analyst target ({money(s.target_mean, s.currency)}). That can happen after a strong run: analysts may raise their
-                  targets, or some may downgrade the stock. The "{prettyRating(s.recommendation)}" rating may lag behind the
-                  price.
+                  analyst target ({money(s.target_mean, s.currency)}).{" "}
+                  {s.recommendation?.includes("buy")
+                    ? `That can happen after a strong run: analysts may raise their targets, or some may downgrade the stock. The "${prettyRating(s.recommendation)}" rating may lag behind the price.`
+                    : s.recommendation?.includes("sell") || s.recommendation === "underperform"
+                    ? "On average, analysts see the stock as overvalued, which matches their negative rating."
+                    : "On average, analysts see no further upside from here, which fits their cautious Hold rating. Targets may rise if the business keeps improving."}
                 </div>
               )}
 
@@ -1138,7 +1168,7 @@ export default function App() {
             <div className="card health-card">
               <div className="brief-label">Financial health</div>
               <div className="health-grid">
-                {healthItems(s.financials, s.shareholder_returns, s.financial_currency ?? s.currency).map(item => (
+                {healthItems(s.financials, s.shareholder_returns, s.financial_currency ?? s.currency, s.volatility_pct, s.listed_in_us ?? true).map(item => (
                   <div key={item.label} className={"health-item " + item.verdict}>
                     <div className="health-label">
                       {item.label} <Info text={item.info} />
