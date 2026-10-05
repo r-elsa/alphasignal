@@ -1156,3 +1156,7 @@ body {
 .also-covered .source-id {
   min-width: 0;
 }
+
+.valuation-card .notice {
+  margin: 0 0 10px;
+}

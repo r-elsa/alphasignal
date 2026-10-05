@@ -13,6 +13,8 @@ interface Stock {
   name: string;
   sector: string | null;
   currency: string;
+  financial_currency: string;
+  market_cap_usd: number | null;
   price: number;
   change: number | null;
   change_pct: number | null;
@@ -113,6 +115,7 @@ interface Peer {
   ticker: string;
   name: string;
   market_cap: number | null;
+  market_cap_usd: number | null;
   change_1y_pct: number | null;
   trailing_pe: number | null;
   forward_pe: number | null;
@@ -137,17 +140,33 @@ interface Result {
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
-const money = (n: number | null) =>
-  n == null ? "—" : "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Prices use the stock's trading currency (London quotes in pence, "GBp"); financials can use another currency
+const currencySymbol = (currency: string) => {
+  try {
+    const part = new Intl.NumberFormat("en-US", { style: "currency", currency }).formatToParts(0).find(p => p.type === "currency");
+    const sym = part?.value ?? currency;
+    return /^[A-Z]{2,3}$/.test(sym) ? sym + " " : sym; // "SEK 12" reads better than "SEK12"
+  } catch {
+    return currency + " ";
+  }
+};
+
+const money = (n: number | null, currency = "USD") => {
+  if (n == null) return "—";
+  if (currency === "GBp") return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "p";
+  const digits = ["JPY", "KRW"].includes(currency) ? 0 : 2;
+  return currencySymbol(currency) + n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+};
 
 const signed = (n: number, suffix = "") => (n > 0 ? "+" : "") + n.toFixed(2) + suffix;
 
-const bigNumber = (n: number | null) => {
+const bigNumber = (n: number | null, currency = "USD") => {
   if (n == null) return "—";
-  if (n >= 1e12) return "$" + (n / 1e12).toFixed(2) + "T";
-  if (n >= 1e9) return "$" + (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
-  return "$" + n.toLocaleString();
+  const sym = currencySymbol(currency === "GBp" ? "GBP" : currency);
+  if (n >= 1e12) return sym + (n / 1e12).toFixed(2) + "T";
+  if (n >= 1e9) return sym + (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return sym + (n / 1e6).toFixed(1) + "M";
+  return sym + Math.round(n).toLocaleString("en-US");
 };
 
 const prettyRating = (r: string | null) =>
@@ -250,15 +269,16 @@ const targetContext = (s: Stock) => {
   return spread > 0.6 ? "Analysts disagree a lot" : spread < 0.25 ? "Analysts broadly agree" : null;
 };
 
-const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
+const healthItems = (f: Financials, returns: Stock["shareholder_returns"], cur: string) => {
+  const sym = currencySymbol(cur);
   const items: { label: string; value: string; note: string; verdict: Verdict; info: string }[] = [];
   if (f.revenue_growth_pct != null) {
     const g = f.revenue_growth_pct;
     items.push({
       label: "Sales growth",
       value: pct(g) + " vs. last year",
-      note: g > 10 ? "Growing fast" : g >= 0 ? "Growing slowly" : "Sales are shrinking",
-      verdict: g > 10 ? "good" : g >= 0 ? "ok" : "bad",
+      note: g > 10 ? "Growing fast" : g >= 2 ? "Growing slowly" : g > -2 ? "Roughly flat" : "Sales are shrinking",
+      verdict: g > 10 ? "good" : g > -2 ? "ok" : "bad",
       info: EXPLAIN.revenueGrowth,
     });
   }
@@ -267,7 +287,7 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
     items.push({
       label: "Profit margin",
       value: m.toFixed(1) + "%",
-      note: m < 0 ? "Losing money" : `Keeps $${Math.round(m)} of every $100 in sales as profit`,
+      note: m < 0 ? "Losing money" : `Keeps ${sym}${Math.round(m)} of every ${sym}100 in sales as profit`,
       verdict: m > 15 ? "good" : m >= 0 ? "ok" : "bad",
       info: EXPLAIN.profitMargin,
     });
@@ -294,7 +314,7 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
     }
     items.push({
       label: "Cash vs. debt",
-      value: `${bigNumber(f.total_cash)} / ${bigNumber(f.total_debt)}`,
+      value: `${bigNumber(f.total_cash, cur)} / ${bigNumber(f.total_debt, cur)}`,
       note,
       verdict,
       info: EXPLAIN.cashDebt,
@@ -304,7 +324,7 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
     const positive = f.free_cash_flow > 0;
     items.push({
       label: "Free cash flow",
-      value: (positive ? "" : "−") + bigNumber(Math.abs(f.free_cash_flow)) + " / yr",
+      value: (positive ? "" : "−") + bigNumber(Math.abs(f.free_cash_flow), cur) + " / yr",
       note: positive ? "Generates cash after investing" : "Spending more cash than it brings in",
       verdict: positive ? "good" : "bad",
       info: EXPLAIN.freeCashFlow,
@@ -315,9 +335,9 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
     const losing = f.profit_margin_pct != null && f.profit_margin_pct < 0;
     items.push({
       label: "Returned to shareholders",
-      value: bigNumber(returns.buybacks + returns.dividends) + " / yr",
+      value: bigNumber(returns.buybacks + returns.dividends, cur) + " / yr",
       note:
-        `Buybacks ${bigNumber(returns.buybacks)} + dividends ${bigNumber(returns.dividends)}` +
+        `Buybacks ${bigNumber(returns.buybacks, cur)} + dividends ${bigNumber(returns.dividends, cur)}` +
         (returns.yield_pct != null ? ` — about ${returns.yield_pct}% of the company's value` : "") +
         (y ? ` (dividend yield ${y.toFixed(2)}%)` : "") +
         (losing && returns.dividends > 0 ? ". Paying out while losing money — the dividend could be cut" : ""),
@@ -387,7 +407,7 @@ const RANGES = [
 const fullDate = (iso: string) =>
   new Date(iso + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
-function PriceChart({ ticker, target }: { ticker: string; target: number | null }) {
+function PriceChart({ ticker, target, currency }: { ticker: string; target: number | null; currency: string }) {
   const [range, setRange] = useState("1y");
   const [points, setPoints] = useState<PricePoint[]>([]);
   const [failed, setFailed] = useState(false);
@@ -438,7 +458,7 @@ function PriceChart({ ticker, target }: { ticker: string; target: number | null 
           <div className="brief-label">Price history</div>
           {shown && (
             <div className="chart-readout">
-              <strong>{money(shown.close)}</strong>
+              <strong>{money(shown.close, currency)}</strong>
               <span>{hover != null ? fullDate(shown.date) : <span className={up ? "green-text" : "red-text"}>{pct(change)} over {rangeLong}</span>}</span>
             </div>
           )}
@@ -462,7 +482,7 @@ function PriceChart({ ticker, target }: { ticker: string; target: number | null 
             onPointerMove={onMove}
             onPointerLeave={() => setHover(null)}
             role="img"
-            aria-label={`${ticker} price over ${rangeLong}: from ${money(first)} to ${money(last)}`}
+            aria-label={`${ticker} price over ${rangeLong}: from ${money(first, currency)} to ${money(last, currency)}`}
           >
             <path d={area} className={up ? "chart-area up" : "chart-area down"} />
             <path d={line} className={up ? "chart-line up" : "chart-line down"} vectorEffect="non-scaling-stroke" />
@@ -478,7 +498,7 @@ function PriceChart({ ticker, target }: { ticker: string; target: number | null 
           </svg>
           <div className="chart-footer">
             <span>{fullDate(points[0].date)}</span>
-            {showTarget && <span className="chart-target-label">- - Avg. analyst target {money(target)}</span>}
+            {showTarget && <span className="chart-target-label">- - Avg. analyst target {money(target, currency)}</span>}
             <span>{fullDate(points[points.length - 1].date)}</span>
           </div>
         </>
@@ -488,6 +508,15 @@ function PriceChart({ ticker, target }: { ticker: string; target: number | null 
 }
 
 // ── Valuation history ─────────────────────────────────────────────────────────
+// The history uses adjusted earnings; only repeat its verdict next to the header's P/E when the two agree
+const comparablePe = (s: Stock) => {
+  const v = s.valuation_history;
+  if (!v || v.current == null || s.trailing_pe == null || s.trailing_pe <= 0) return false;
+  return Math.abs(v.current - s.trailing_pe) / s.trailing_pe <= 0.2;
+};
+
+const isCyclical = (v: ValuationHistory) => v.low > 0 && v.high / v.low > 4;
+
 const historyVerdict = (v: ValuationHistory) => {
   if (v.current == null) return null;
   return v.current > v.average * 1.15
@@ -506,7 +535,7 @@ function ValuationCard({ name, v }: { name: string; v: ValuationHistory }) {
   const y = (val: number) => PAD + (1 - (val - (lo - pad)) / (hi - lo + 2 * pad)) * (H - 2 * PAD);
   const line = v.series.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.pe).toFixed(1)}`).join(" ");
   const verdict = historyVerdict(v);
-  const shortName = name.replace(/,? (Inc\.?|Corporation|Corp\.?|Company|Co\.)$/i, "");
+  const shortName = name.replace(/,? (Inc\.?|Corporation|Corp\.?|Company|Co\.|Oyj|Abp|AB|ASA|A\/S|plc|SE|AG|N\.V\.|S\.A\.)$/i, "");
 
   return (
     <div className="card valuation-card">
@@ -517,6 +546,12 @@ function ValuationCard({ name, v }: { name: string; v: ValuationHistory }) {
         {verdict && <strong>{verdict} for {shortName}.</strong>} P/E is <strong>{v.current ?? "—"}</strong> now vs. a
         5-year average of <strong>{v.average}</strong> (range {v.low}–{v.high}).
       </p>
+      {isCyclical(v) && (
+        <p className="notice">
+          <strong>P/E swings a lot for {shortName}</strong> ({v.low} to {v.high}). This is typical for cyclical
+          businesses, where profits rise and fall with the economy, so the average is only a rough guide.
+        </p>
+      )}
       <svg className="valuation-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img"
         aria-label={`P/E over 5 years, between ${v.low} and ${v.high}, average ${v.average}`}>
         <line x1={PAD} x2={W - PAD} y1={y(v.average)} y2={y(v.average)} className="chart-target" vectorEffect="non-scaling-stroke" />
@@ -546,6 +581,7 @@ function PeersCard({ result }: { result: Result }) {
     ticker,
     name: s.name,
     market_cap: s.market_cap,
+    market_cap_usd: s.market_cap_usd,
     change_1y_pct: null,
     trailing_pe: s.trailing_pe,
     forward_pe: s.forward_pe,
@@ -568,7 +604,7 @@ function PeersCard({ result }: { result: Result }) {
           <thead>
             <tr>
               <th>Company</th>
-              <th>Size <Info text={EXPLAIN.marketCap} /></th>
+              <th>Size (USD) <Info text={EXPLAIN.marketCap} /></th>
               <th>P/E (fwd) <Info text={EXPLAIN.pe} /></th>
               <th>Sales growth <Info text={EXPLAIN.revenueGrowth} /></th>
               <th>Profit margin <Info text={EXPLAIN.profitMargin} /></th>
@@ -581,7 +617,7 @@ function PeersCard({ result }: { result: Result }) {
                   <strong>{p.ticker}</strong>
                   <span className="peer-name">{p.name}</span>
                 </td>
-                <td>{bigNumber(p.market_cap)}</td>
+                <td>{bigNumber(p.market_cap_usd ?? p.market_cap, "USD")}</td>
                 <td>{peDisplay(p.forward_pe)}</td>
                 <td className={toneClass(p.revenue_growth_pct)}>{pctDisplay(p.revenue_growth_pct)}</td>
                 <td className={toneClass(p.profit_margin_pct && p.profit_margin_pct < 0 ? -1 : 0)}>
@@ -663,15 +699,30 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [ticker, showSuggestions]);
 
-  const analyze = (t?: string, refresh = false) => {
-    const target = (t || ticker).trim().toUpperCase();
-    if (!target) return;
-    setTicker(target);
+  // Turn free text like "nvidia" into a ticker. An exact ticker match always wins, so "F" stays Ford.
+  const resolveTicker = async (text: string) => {
+    const typed = text.trim().toUpperCase();
+    try {
+      const res = await fetch(`${API}/search?q=${encodeURIComponent(text.trim())}`);
+      const found: Suggestion[] = res.ok ? await res.json() : [];
+      if (found.some(s => s.symbol === typed)) return typed;
+      return found[0]?.symbol ?? typed;
+    } catch {
+      return typed;
+    }
+  };
+
+  // `exact` = the caller already has a real ticker (suggestion, recent search, refresh)
+  const analyze = async (t?: string, refresh = false, exact = false) => {
+    const input = (t || ticker).trim();
+    if (!input) return;
     setShowSuggestions(false);
     setSuggestions([]);
-    window.history.replaceState(null, "", `?t=${encodeURIComponent(target)}`);
     setLoading(true);
     setError("");
+    const target = exact ? input.toUpperCase() : await resolveTicker(input);
+    setTicker(target);
+    window.history.replaceState(null, "", `?t=${encodeURIComponent(target)}`);
     setResult(null);
     setSteps({});
 
@@ -715,11 +766,8 @@ export default function App() {
     } else if (e.key === "Escape") {
       setShowSuggestions(false);
     } else if (e.key === "Enter") {
-      const typed = ticker.trim().toUpperCase();
-      if (highlight >= 0 && suggestions[highlight]) return analyze(suggestions[highlight].symbol);
-      // "tesla" + Enter should find TSLA, but an exact ticker match always wins
-      const exact = suggestions.find(s => s.symbol === typed);
-      analyze(exact ? exact.symbol : suggestions[0] ? suggestions[0].symbol : typed);
+      if (highlight >= 0 && suggestions[highlight]) return analyze(suggestions[highlight].symbol, false, true);
+      analyze();
     }
   };
 
@@ -820,7 +868,7 @@ export default function App() {
                     className={i === highlight ? "active" : ""}
                     onMouseDown={e => {
                       e.preventDefault();
-                      analyze(sug.symbol);
+                      analyze(sug.symbol, false, true);
                     }}
                     onMouseEnter={() => setHighlight(i)}
                   >
@@ -847,7 +895,7 @@ export default function App() {
               <button
                 key={i}
                 className="history-tag"
-                onClick={() => analyze(h)}
+                onClick={() => analyze(h, false, true)}
                 disabled={loading}
               >
                 {h}
@@ -922,7 +970,7 @@ export default function App() {
                 <div className="stock-stats">
                   <div className="stat">
                     <div className="stat-label">Price <Info text={EXPLAIN.price} /></div>
-                    <div className="stat-value">{money(s.price)}</div>
+                    <div className="stat-value">{money(s.price, s.currency)}</div>
                     {s.change != null && s.change_pct != null && (
                       <div className={"stat-sub " + toneClass(s.change)}>
                         {signed(s.change)} ({signed(s.change_pct, "%")})
@@ -931,7 +979,7 @@ export default function App() {
                   </div>
                   <div className="stat">
                     <div className="stat-label">Avg. target <Info text={EXPLAIN.target} /></div>
-                    <div className="stat-value">{money(s.target_mean)}</div>
+                    <div className="stat-value">{money(s.target_mean, s.currency)}</div>
                     {s.upside_pct != null && (
                       <div className={"stat-sub " + toneClass(s.upside_pct)}>
                         {(s.upside_pct > 0 ? "+" : "") + s.upside_pct.toFixed(1)}% {s.upside_pct >= 0 ? "upside" : "downside"}
@@ -939,7 +987,7 @@ export default function App() {
                     )}
                     {s.target_low != null && s.target_high != null && (
                       <div className="stat-sub">
-                        {money(s.target_low)} – {money(s.target_high)}
+                        {money(s.target_low, s.currency)} – {money(s.target_high, s.currency)}
                         {s.analyst_count != null && ` · ${s.analyst_count} targets`}
                       </div>
                     )}
@@ -959,8 +1007,8 @@ export default function App() {
 
               {s.upside_pct != null && s.upside_pct < 0 && s.target_mean != null && (
                 <div className="notice">
-                  <strong>Already above the analysts' target.</strong> The price ({money(s.price)}) has passed the average
-                  analyst target ({money(s.target_mean)}). That can happen after a strong run: analysts may raise their
+                  <strong>Already above the analysts' target.</strong> The price ({money(s.price, s.currency)}) has passed the average
+                  analyst target ({money(s.target_mean, s.currency)}). That can happen after a strong run: analysts may raise their
                   targets, or some may downgrade the stock. The "{prettyRating(s.recommendation)}" rating may lag behind the
                   price.
                 </div>
@@ -969,12 +1017,14 @@ export default function App() {
               <div className="metrics">
                 <div>
                   <span>Market cap <Info text={EXPLAIN.marketCap} /></span>
-                  {bigNumber(s.market_cap)}
-                  {capContext(s.market_cap) && <div className="context">{capContext(s.market_cap)}</div>}
+                  {bigNumber(s.market_cap, s.currency)}
+                  {capContext(s.market_cap_usd ?? s.market_cap) && (
+                    <div className="context">{capContext(s.market_cap_usd ?? s.market_cap)}</div>
+                  )}
                 </div>
                 <div>
                   <span>52-week range <Info text={EXPLAIN.range52} /></span>
-                  {money(s.week52_low)} – {money(s.week52_high)}
+                  {money(s.week52_low, s.currency)} – {money(s.week52_high, s.currency)}
                   {(() => {
                     const r = rangeContext(s.price, s.week52_low, s.week52_high);
                     return r ? (
@@ -995,7 +1045,7 @@ export default function App() {
                       {peContext(s.trailing_pe, s.forward_pe, s.financials.profit_margin_pct, result.peers?.medians.forward_pe)}
                     </div>
                   )}
-                  {s.valuation_history && historyVerdict(s.valuation_history) && (
+                  {s.valuation_history && historyVerdict(s.valuation_history) && comparablePe(s) && (
                     <div className="context">
                       {historyVerdict(s.valuation_history)} (5-yr avg {s.valuation_history.average})
                     </div>
@@ -1014,13 +1064,13 @@ export default function App() {
                   return newest ? <> · newest article {shortDate(newest)}</> : null;
                 })()}
                 {" · "}
-                <button className="link-button" onClick={() => analyze(result.ticker, true)}>
+                <button className="link-button" onClick={() => analyze(result.ticker, true, true)}>
                   Refresh
                 </button>
               </div>
             </div>
 
-            <PriceChart ticker={result.ticker} target={s.target_mean} />
+            <PriceChart ticker={result.ticker} target={s.target_mean} currency={s.currency} />
 
             <div className="card brief-card">
               <div className="brief-label">⚡ AI Investment Brief</div>
@@ -1088,7 +1138,7 @@ export default function App() {
             <div className="card health-card">
               <div className="brief-label">Financial health</div>
               <div className="health-grid">
-                {healthItems(s.financials, s.shareholder_returns).map(item => (
+                {healthItems(s.financials, s.shareholder_returns, s.financial_currency ?? s.currency).map(item => (
                   <div key={item.label} className={"health-item " + item.verdict}>
                     <div className="health-label">
                       {item.label} <Info text={item.info} />
@@ -1123,7 +1173,8 @@ export default function App() {
                           <div className="earnings-q-label">Quarter to {monthYear(q.quarter_end)}</div>
                           <div className="earnings-q-result">{beat ? "Beat" : "Missed"} {pct(q.surprise_pct)}</div>
                           <div className="earnings-q-detail">
-                            ${q.eps_actual.toFixed(2)} vs. ${q.eps_estimate.toFixed(2)} expected
+                            {money(q.eps_actual, s.currency === "GBp" ? "GBP" : s.currency)} vs.{" "}
+                            {money(q.eps_estimate, s.currency === "GBp" ? "GBP" : s.currency)} expected
                           </div>
                         </div>
                       );
@@ -1144,14 +1195,14 @@ export default function App() {
                       <p className="earnings-summary">
                         {s.insiders.purchases > 0 && (
                           <>
-                            <strong className="green-text">Bought {bigNumber(s.insiders.bought)}</strong> in {s.insiders.purchases} trade
+                            <strong className="green-text">Bought {bigNumber(s.insiders.bought, s.currency)}</strong> in {s.insiders.purchases} trade
                             {s.insiders.purchases > 1 ? "s" : ""}
                             {s.insiders.sales > 0 ? " · " : ". "}
                           </>
                         )}
                         {s.insiders.sales > 0 && (
                           <>
-                            <strong>Sold {bigNumber(s.insiders.sold)}</strong> in {s.insiders.sales} trade{s.insiders.sales > 1 ? "s" : ""}.{" "}
+                            <strong>Sold {bigNumber(s.insiders.sold, s.currency)}</strong> in {s.insiders.sales} trade{s.insiders.sales > 1 ? "s" : ""}.{" "}
                           </>
                         )}
                         <span className="muted-inline">
@@ -1164,7 +1215,7 @@ export default function App() {
                         {s.insiders.recent.map((t, i) => (
                           <li key={i}>
                             <span className={t.type === "purchase" ? "green-text" : ""}>{t.type === "purchase" ? "Bought" : "Sold"}</span>{" "}
-                            {t.value ? bigNumber(t.value) : ""} · {t.name}
+                            {t.value ? bigNumber(t.value, s.currency) : ""} · {t.name}
                             {t.position && <span className="muted-inline">, {t.position}</span>}
                             <span className="muted-inline"> · {shortDate(t.date)}</span>
                           </li>
@@ -1194,7 +1245,7 @@ export default function App() {
             <div className="card sources-card">
               <div className="brief-label">
                 Sources · {result.articles.filter(a => !a.same_story_as).length} stories, {result.articles.length} articles from{" "}
-                {new Set(result.articles.map(a => a.source)).size} publishers
+                {(n => `${n} publisher${n === 1 ? "" : "s"}`)(new Set(result.articles.map(a => a.source)).size)}
               </div>
               {result.articles.length === 0 && <p className="muted">No recent articles found.</p>}
               <ol className="source-list">

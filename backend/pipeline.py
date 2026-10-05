@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import calendar
 import datetime
 import feedparser
@@ -50,7 +51,7 @@ class ArticleSentiment(BaseModel):
 class Brief(BaseModel):
     company_description: str = Field(description="One plain sentence a beginner understands: what the company does and how it makes money. No jargon.")
     tldr: str = Field(description="One or two plain sentences summing up the current situation for a beginner investor.")
-    developments: List[Development] = Field(description="3-5 most important recent events, most impactful first.")
+    developments: List[Development] = Field(description="Up to 5 most important recent events, most impactful first. Fewer (even zero) is fine when there is little real news.")
     bull_case: List[Point] = Field(description="2-3 specific reasons the stock could go up.")
     bear_case: List[Point] = Field(description="2-3 specific risks for this company. No generic market risks.")
     watch: List[str] = Field(description="2-4 upcoming catalysts or open questions to watch, with dates when known.")
@@ -84,7 +85,7 @@ def _published(entry) -> Optional[str]:
     return datetime.datetime.fromtimestamp(calendar.timegm(parsed), tz=datetime.timezone.utc).isoformat()
 
 
-def _valuation_history(stock, price: Optional[float]) -> Optional[dict]:
+def _valuation_history(stock, price: Optional[float], price_scale: float = 1.0) -> Optional[dict]:
     """Trailing P/E over the last 5 years: price on each date / sum of the 4 quarterly EPS reported before it."""
     ed = stock.get_earnings_dates(limit=32)
     if ed is None or ed.empty or not price:
@@ -104,6 +105,7 @@ def _valuation_history(stock, price: Optional[float]) -> Optional[dict]:
     for idx, close in prices.items():
         at = idx.tz_localize(None) if idx.tzinfo else idx
         e = ttm_eps(at)
+        close = close * price_scale
         if e is None or e <= 0 or close / e > 300:
             skipped += 1  # losses or near-zero profit make P/E meaningless
             continue
@@ -128,6 +130,11 @@ def _valuation_history(stock, price: Optional[float]) -> Optional[dict]:
 BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 MAX_ARTICLES = 20
 MAX_PER_PUBLISHER = 3
+GENERIC_BUSINESS_WORDS = {
+    "motor", "motors", "technologies", "technology", "systems", "industries", "international", "brands",
+    "entertainment", "communications", "pharmaceuticals", "energy", "financial", "platforms", "networks",
+    "semiconductor", "devices", "airlines", "foods", "resources", "therapeutics", "labs", "software",
+}
 GENERIC_WORDS = {"bank", "first", "general", "american", "united", "international", "global", "national", "new", "the"}
 QUOTE_PAGE = re.compile(r"stock price, news, quote|stock quote|price, news, quote", re.I)
 # Recurring low-value formats: fund holding changes, auto-generated "facts" posts, "$1,000 invested" bait
@@ -145,6 +152,10 @@ FILLER = re.compile(
         r"is attracting investor attention",
         r"here is what you should know",
         r"\bstock (jumps|falls|rises|drops|gaps (up|down)|trading (up|down)) [\d.]+%.{0,10}(what's next|here's why)",
+        r"\bstock (gains|falls|rises|drops|climbs|slips|jumps) [\d.]+ ?(percent|%)",
+        r"\b(pre-?market|after-?hours|intraday) at (EUR|USD|GBP|SEK|NOK|DKK|CHF|\$|€)",
+        r"\b(minus|plus) [\d.]+ percent\b",
+        r"earnings date and reports",
         r"price history for",
         r"institutional ownership",
         r"short interest",
@@ -172,9 +183,51 @@ def _title_words(title: str, ticker: str) -> set:
 
 
 def _short_name(name: str) -> str:
-    """'NVIDIA Corporation' -> 'NVIDIA', 'Apple Inc.' -> 'Apple'."""
+    """'NVIDIA Corporation' -> 'NVIDIA', 'Apple Inc.' -> 'Apple', 'Stora Enso Oyj' -> 'Stora Enso'."""
     short = re.sub(r"\b(corporation|corp|incorporated|inc|ltd|limited|plc|holdings?|group|company|co|n\.v|s\.a|ag|se)\b\.?", "", name, flags=re.I)
+    # European legal forms, only at the end so names like "AB InBev" survive
+    short = re.sub(r"[,\s]+(oyj|abp|ab|asa|a/s|sa/nv|aktiengesellschaft|kgaa|s\.?p\.?a\.?|b\.?v\.?)\.?$", "", short.strip(), flags=re.I)
     return re.sub(r"[,\s]+$", "", short).strip() or name
+
+
+# Exchange suffix -> Google News edition (language, country) for local-language coverage
+HOME_MARKETS = {
+    "HE": ("fi", "FI"), "ST": ("sv", "SE"), "OL": ("no", "NO"), "CO": ("da", "DK"), "IC": ("is", "IS"),
+    "DE": ("de", "DE"), "F": ("de", "DE"), "VI": ("de", "AT"), "SW": ("de", "CH"),
+    "PA": ("fr", "FR"), "BR": ("fr", "BE"), "AS": ("nl", "NL"), "MI": ("it", "IT"), "MC": ("es", "ES"),
+    "LS": ("pt-PT", "PT"), "WA": ("pl", "PL"), "L": ("en-GB", "GB"), "IR": ("en-IE", "IE"),
+    "TO": ("en-CA", "CA"), "V": ("en-CA", "CA"), "AX": ("en-AU", "AU"), "NZ": ("en-NZ", "NZ"),
+    "T": ("ja", "JP"), "HK": ("zh-HK", "HK"), "KS": ("ko", "KR"), "SI": ("en-SG", "SG"), "NS": ("en-IN", "IN"),
+}
+
+
+def _google_news_url(query: str, lang: str = "en-US", country: str = "US") -> str:
+    ceid_lang = lang.split("-")[0] if lang not in ("pt-PT", "zh-HK") else lang
+    return f"https://news.google.com/rss/search?q={quote_plus(query)}&hl={lang}&gl={country}&ceid={country}:{ceid_lang}"
+
+
+_fx_cache = {}
+
+
+def _usd_rate(currency: Optional[str]) -> Optional[float]:
+    """How many US dollars one unit of `currency` is worth. London quotes in pence (GBp)."""
+    if not currency:
+        return None
+    if currency == "USD":
+        return 1.0
+    if currency == "GBp":
+        rate = _usd_rate("GBP")
+        return rate / 100 if rate else None
+    hit = _fx_cache.get(currency)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    try:
+        rate = float(yf.Ticker(f"{currency}USD=X").fast_info["last_price"])
+    except Exception as e:
+        print(f"[FX] No rate for {currency}: {e}")
+        return None
+    _fx_cache[currency] = (time.time(), rate)
+    return rate
 
 
 def scraper_agent(state: AgentState) -> AgentState:
@@ -182,25 +235,41 @@ def scraper_agent(state: AgentState) -> AgentState:
     company = _short_name(state["stock_info"].get("name") or ticker)
     print(f"[Scraper Agent] Fetching news for {ticker} ({company})...")
 
+    # Foreign listings ("STERV.HE"): US feeds don't know the ticker, so search by name, also in the home market
+    base, _, suffix = ticker.partition(".")
+    foreign = bool(suffix)
+    home = HOME_MARKETS.get(suffix.upper()) if foreign else None
+
     # Short tickers like "F" or "GM" are too ambiguous to search or match on their own
-    short_ticker = len(ticker) <= 2
-    first_word = company.split()[0]
+    short_ticker = len(base) <= 2
+    first_word, *rest = company.split()
     names = [company]
-    if first_word != company and len(first_word) >= 4 and first_word.lower() not in GENERIC_WORDS:
-        names.append(first_word)  # "Ford Motor" -> also match "Ford"
+    # "Ford Motor" -> also match "Ford", but not "Stora Enso" -> "Stora" (which matches unrelated things)
+    if rest and all(w.lower() in GENERIC_BUSINESS_WORDS for w in rest) and len(first_word) >= 4 and first_word.lower() not in GENERIC_WORDS:
+        names.append(first_word)
+    name_query = " OR ".join(f'"{n}"' for n in names)
     if short_ticker:
-        ticker_pattern = rf"(\(|\$|NYSE:\s?|NASDAQ:\s?){re.escape(ticker)}\b"
-        google_query = quote_plus(" OR ".join(f'"{n}"' for n in names) + " stock when:7d")
+        ticker_pattern = rf"(\(|\$|NYSE:\s?|NASDAQ:\s?){re.escape(base)}\b"
+        english_query = f"{name_query} stock"
     else:
-        ticker_pattern = rf"\b{re.escape(ticker)}\b"
-        google_query = quote_plus(" OR ".join(f'"{n}"' for n in names) + f" OR {ticker} stock when:7d")
-    feeds = [
+        ticker_pattern = rf"\b{re.escape(base)}\b"
+        english_query = f"{name_query} stock" if foreign else f"{name_query} OR {ticker} stock"
+
+    def google_feeds(window):
         # Google News aggregates many publishers (Reuters, CNBC, WSJ, Bloomberg, FT, Barron's...)
-        (f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US:en", "Google News"),
-        (f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US", "Yahoo Finance"),
-        (f"https://seekingalpha.com/api/sa/combined/{ticker}.xml", "Seeking Alpha"),
-        (f"https://www.nasdaq.com/feed/rssoutbound?symbol={ticker}", "Nasdaq"),
-    ]
+        urls = [(_google_news_url(f"{english_query} when:{window}"), "Google News")]
+        if home and home != ("en-US", "US"):
+            # Local press writes about home companies by name, without "stock"
+            urls.append((_google_news_url(f"{name_query} when:{window}", *home), "Google News"))
+        return urls
+
+    feeds = google_feeds("7d")
+    if not foreign:
+        feeds += [
+            (f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US", "Yahoo Finance"),
+            (f"https://seekingalpha.com/api/sa/combined/{ticker}.xml", "Seeking Alpha"),
+            (f"https://www.nasdaq.com/feed/rssoutbound?symbol={ticker}", "Nasdaq"),
+        ]
 
     def fetch(url, default_source):
         items = []
@@ -214,8 +283,13 @@ def scraper_agent(state: AgentState) -> AgentState:
                 source = entry.get("source", {}).get("title") or entry.get("publisher") or default_source
                 summary = entry.get("summary", "")
                 if default_source == "Google News":
-                    # Google appends " - Publisher" to titles and its summaries are just HTML links
-                    title = re.sub(r"\s+-\s+[^-]+$", "", title)
+                    # Google appends " - Publisher" to titles (publisher names can contain hyphens)
+                    # and its summaries are just HTML links
+                    publisher = entry.get("source", {}).get("title")
+                    if publisher and title.endswith(f" - {publisher}"):
+                        title = title[: -len(f" - {publisher}")]
+                    else:
+                        title = re.sub(r"\s+-\s+[^-]+$", "", title)
                     summary = ""
                 items.append({
                     "title": title,
@@ -228,19 +302,28 @@ def scraper_agent(state: AgentState) -> AgentState:
             print(f"[Scraper Agent] Failed {default_source}: {e}")
         return items
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        results = executor.map(lambda f: fetch(*f), feeds)
-    articles = [a for items in results for a in items]
+    def fetch_all(feed_list):
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = executor.map(lambda f: fetch(*f), feed_list)
+        return [a for items in results for a in items]
 
     # Keep only articles that actually mention the company
     name_pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b", re.I)
     ticker_re = re.compile(ticker_pattern)
-    articles = [
-        a for a in articles
-        if (name_pattern.search(a["title"] + " " + a["summary"]) or ticker_re.search(a["title"] + " " + a["summary"]))
-        and not QUOTE_PAGE.search(a["title"])
-        and not FILLER.search(a["title"])
-    ]
+
+    def relevant(items):
+        return [
+            a for a in items
+            if (name_pattern.search(a["title"] + " " + a["summary"]) or ticker_re.search(a["title"] + " " + a["summary"]))
+            and not QUOTE_PAGE.search(a["title"])
+            and not FILLER.search(a["title"])
+        ]
+
+    articles = relevant(fetch_all(feeds))
+    if len(articles) < 8:
+        # Less-covered companies: look back a month instead of a week
+        print(f"[Scraper Agent] Only {len(articles)} articles in 7 days, widening to 30 days")
+        articles += relevant(fetch_all(google_feeds("30d")))
 
     # Deduplicate by title, newest first, and cap each publisher so no single one dominates
     articles.sort(key=lambda a: a["published"] or "", reverse=True)
@@ -324,13 +407,8 @@ def consensus_agent(state: AgentState) -> AgentState:
                 value = col.get(name)
                 return abs(float(value)) if value is not None and value == value else 0.0
             buybacks, dividends = _row("Repurchase Of Capital Stock"), _row("Cash Dividends Paid")
-            market_cap = info.get("marketCap")
             if buybacks or dividends:
-                shareholder_returns = {
-                    "buybacks": buybacks,
-                    "dividends": dividends,
-                    "yield_pct": _num((buybacks + dividends) / market_cap * 100, 1) if market_cap else None,
-                }
+                shareholder_returns = {"buybacks": buybacks, "dividends": dividends, "yield_pct": None}  # yield set below, in USD
     except Exception as e:
         print(f"[Consensus Agent] No cash flow data: {e}")
 
@@ -371,7 +449,8 @@ def consensus_agent(state: AgentState) -> AgentState:
 
     valuation_history = None
     try:
-        valuation_history = _valuation_history(stock, price)
+        valuation_history = _valuation_history(stock, price / 100 if price and info.get("currency") == "GBp" else price,
+                                               0.01 if info.get("currency") == "GBp" else 1.0)
     except Exception as e:
         print(f"[Consensus Agent] No valuation history: {e}")
 
@@ -393,18 +472,34 @@ def consensus_agent(state: AgentState) -> AgentState:
         "beta": _num(info.get("beta")),
     }
 
+    # Prices and market cap are in the trading currency (London: pence); financial statements can differ
+    # (Toyota trades in USD but reports in JPY)
+    price_currency = info.get("currency") or "USD"
+    market_cap_currency = "GBP" if price_currency == "GBp" else price_currency
+    financial_currency = info.get("financialCurrency") or market_cap_currency
+    market_cap_rate, financial_rate = _usd_rate(market_cap_currency), _usd_rate(financial_currency)
+    market_cap_usd = info.get("marketCap") * market_cap_rate if info.get("marketCap") and market_cap_rate else None
+    if shareholder_returns:
+        total = shareholder_returns["buybacks"] + shareholder_returns["dividends"]
+        shareholder_returns["yield_pct"] = (
+            _num(total * financial_rate / market_cap_usd * 100, 1) if financial_rate and market_cap_usd else None
+        )
+
     links = {
         "income_statement": f"https://finance.yahoo.com/quote/{ticker}/financials",
         "balance_sheet": f"https://finance.yahoo.com/quote/{ticker}/balance-sheet",
         "cash_flow": f"https://finance.yahoo.com/quote/{ticker}/cash-flow",
-        "sec_filings": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=10-&dateb=&owner=include&count=40",
+        # Only US listings (including foreign companies' US ADRs) file with the SEC
+        "sec_filings": None if "." in ticker else f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=10-&dateb=&owner=include&count=40",
         "company_website": info.get("website"),
     }
 
     stock_info = {
         "name": info.get("longName") or info.get("shortName") or ticker,
         "sector": info.get("sector"),
-        "currency": info.get("currency", "USD"),
+        "currency": price_currency,
+        "financial_currency": financial_currency,
+        "market_cap_usd": market_cap_usd,
         "price": price,
         "change": _num(price - prev_close) if price and prev_close else None,
         "change_pct": _num((price - prev_close) / prev_close * 100) if price and prev_close else None,
@@ -490,8 +585,11 @@ def _peer_metrics(ticker: str) -> Optional[dict]:
     if not info.get("marketCap"):
         return None
     pct = lambda v: round(v * 100, 1) if isinstance(v, (int, float)) else None
+    currency = info.get("currency") or "USD"
+    rate = _usd_rate("GBP" if currency == "GBp" else currency)
     return {
         "ticker": ticker,
+        "market_cap_usd": info["marketCap"] * rate if rate else None,
         "name": info.get("shortName") or info.get("longName") or ticker,
         "market_cap": info.get("marketCap"),
         "change_1y_pct": pct(info.get("52WeekChange")),
@@ -520,7 +618,8 @@ def peers_agent(state: AgentState) -> AgentState:
         metrics = [m for m in executor.map(_peer_metrics, candidates) if m]
     # Keep the reviewer's relevance order
     # Tiny companies (e.g. HP next to Apple) distort the comparison; keep the filter only if enough peers remain
-    big_enough = [m for m in metrics if s.get("market_cap") and m["market_cap"] >= 0.01 * s["market_cap"]]
+    own_size = s.get("market_cap_usd")
+    big_enough = [m for m in metrics if own_size and m["market_cap_usd"] and m["market_cap_usd"] >= 0.01 * own_size]
     peers = (big_enough if len(big_enough) >= 2 else metrics)[:MAX_PEERS]
 
     def median(key):
@@ -589,7 +688,9 @@ RECENT ARTICLES (cite by ID):
 {article_list}
 
 Rules:
-- Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles and long-range price predictions.
+- Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles, long-range price predictions and routine daily price moves (e.g. "shares indicated lower pre-market"). Combine several analyst target changes into at most one item. Never pad the list: if there are few real events, list fewer and say in the TL;DR that recent news is thin.
+- Articles may be in other languages. Always write in English.
+- Amounts are in {s['currency']} (prices) and {s['financial_currency']} (financials). Use the right currency, never assume dollars.
 - Every development must cite at least one article ID. Never cite an ID that is not in the list.
 - Bull and bear points must be specific to this company. Do not write generic risks like "market volatility" or "economic uncertainty". Prefer points supported by the articles; if a point comes from the financial data above or general background knowledge, leave source_ids empty.
 - Facts in the articles beat your background knowledge, which may be out of date. Copy names, job titles, numbers and dates exactly as the articles state them; never "correct" an article from memory. If you are unsure what an event is, say so plainly instead of writing around it.
