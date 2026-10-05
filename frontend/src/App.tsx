@@ -34,6 +34,25 @@ interface Stock {
   financials: Financials;
   earnings_history: EarningsQuarter[];
   links: Record<"income_statement" | "balance_sheet" | "cash_flow" | "sec_filings" | "company_website", string | null>;
+  shareholder_returns: { buybacks: number; dividends: number; yield_pct: number | null } | null;
+  insiders: Insiders | null;
+  valuation_history: ValuationHistory | null;
+}
+
+interface ValuationHistory {
+  current: number | null;
+  average: number;
+  low: number;
+  high: number;
+  series: { date: string; pe: number }[];
+}
+
+interface Insiders {
+  sold: number;
+  bought: number;
+  sales: number;
+  purchases: number;
+  recent: { name: string; position: string; type: "sale" | "purchase"; value: number; date: string }[];
 }
 
 interface Financials {
@@ -87,6 +106,7 @@ interface Article {
   source: string;
   published: string | null;
   sentiment: "positive" | "negative" | "neutral";
+  same_story_as?: number;
 }
 
 interface Peer {
@@ -101,9 +121,10 @@ interface Peer {
 }
 
 interface Peers {
-  source: "finnhub" | "ai";
+  source: "finnhub" | "finnhub+ai" | "ai";
   companies: Peer[];
   medians: Partial<Record<"forward_pe" | "trailing_pe" | "revenue_growth_pct" | "profit_margin_pct" | "change_1y_pct", number | null>>;
+  summary?: string[];
 }
 
 interface Result {
@@ -167,6 +188,12 @@ const EXPLAIN: Record<string, string> = {
     "Cash left over after running the business and investing in it. Positive means the company funds itself; negative means it needs savings or borrowing.",
   dividend:
     "Cash paid to shareholders each year, as a % of the share price. The payout ratio is the share of profit paid out; above 100% is hard to sustain.",
+  shareholderReturns:
+    "Cash the company handed back to shareholders over the last year. Buybacks (the company buying its own shares) shrink the number of shares, so each remaining share owns more of the company. Dividends are paid out as cash.",
+  insiders:
+    "Trades by the company's own executives and directors over the last 6 months (open-market only; stock grants are left out). Executives often sell for routine reasons like taxes or diversification, so selling is common. Buying with their own money is rarer and usually a stronger signal.",
+  peHistory:
+    "Compares today's P/E with the stock's own past. A company that is usually valued highly isn't necessarily expensive today; one that is far above its usual level means investors are more optimistic than normal, which leaves less room for disappointment.",
   beta:
     "How much the stock tends to move compared with the overall market. 1 = same as the market, 2 = about twice as much up and down.",
   earningsHistory:
@@ -223,7 +250,7 @@ const targetContext = (s: Stock) => {
   return spread > 0.6 ? "Analysts disagree a lot" : spread < 0.25 ? "Analysts broadly agree" : null;
 };
 
-const healthItems = (f: Financials) => {
+const healthItems = (f: Financials, returns: Stock["shareholder_returns"]) => {
   const items: { label: string; value: string; note: string; verdict: Verdict; info: string }[] = [];
   if (f.revenue_growth_pct != null) {
     const g = f.revenue_growth_pct;
@@ -246,12 +273,30 @@ const healthItems = (f: Financials) => {
     });
   }
   if (f.total_cash != null && f.total_debt != null) {
-    const ratio = f.total_debt / Math.max(f.total_cash, 1);
+    // A big cash generator can carry debt comfortably, so judge debt against yearly free cash flow too
+    const netDebt = f.total_debt - f.total_cash;
+    const fcf = f.free_cash_flow;
+    const years = fcf != null && fcf > 0 ? netDebt / fcf : null;
+    const repayIn = (y: number) => (y < 1 ? `${Math.max(1, Math.round(y * 12))} months` : `${y.toFixed(1)} years`);
+    let note: string, verdict: Verdict;
+    if (netDebt <= 0) {
+      note = "More cash than debt";
+      verdict = "good";
+    } else if (years != null && years <= 3) {
+      note = `More debt than cash, but could pay off the difference with ${repayIn(years)} of free cash flow`;
+      verdict = "good";
+    } else if (years != null && years <= 6) {
+      note = `Would take ${repayIn(years)} of free cash flow to pay off the extra debt`;
+      verdict = "ok";
+    } else {
+      note = years != null ? `Would take ${repayIn(years)} of free cash flow to pay off the extra debt` : "More debt than cash, and not generating spare cash to pay it down";
+      verdict = "bad";
+    }
     items.push({
       label: "Cash vs. debt",
       value: `${bigNumber(f.total_cash)} / ${bigNumber(f.total_debt)}`,
-      note: ratio <= 1 ? "More cash than debt" : ratio <= 3 ? "More debt than cash" : "Debt is much larger than cash",
-      verdict: ratio <= 1 ? "good" : ratio <= 3 ? "ok" : "bad",
+      note,
+      verdict,
       info: EXPLAIN.cashDebt,
     });
   }
@@ -266,7 +311,20 @@ const healthItems = (f: Financials) => {
     });
   }
   const y = f.dividend_yield_pct;
-  items.push({
+  if (returns && returns.buybacks + returns.dividends > 0) {
+    const losing = f.profit_margin_pct != null && f.profit_margin_pct < 0;
+    items.push({
+      label: "Returned to shareholders",
+      value: bigNumber(returns.buybacks + returns.dividends) + " / yr",
+      note:
+        `Buybacks ${bigNumber(returns.buybacks)} + dividends ${bigNumber(returns.dividends)}` +
+        (returns.yield_pct != null ? ` — about ${returns.yield_pct}% of the company's value` : "") +
+        (y ? ` (dividend yield ${y.toFixed(2)}%)` : "") +
+        (losing && returns.dividends > 0 ? ". Paying out while losing money — the dividend could be cut" : ""),
+      verdict: losing && returns.dividends > 0 ? "ok" : "neutral",
+      info: EXPLAIN.shareholderReturns,
+    });
+  } else items.push({
     label: "Dividend",
     value: y ? y.toFixed(2) + "% per year" : "None",
     note: !y
@@ -429,31 +487,57 @@ function PriceChart({ ticker, target }: { ticker: string; target: number | null 
   );
 }
 
+// ── Valuation history ─────────────────────────────────────────────────────────
+const historyVerdict = (v: ValuationHistory) => {
+  if (v.current == null) return null;
+  return v.current > v.average * 1.15
+    ? "More expensive than usual"
+    : v.current < v.average * 0.85
+    ? "Cheaper than usual"
+    : "Around its usual level";
+};
+
+function ValuationCard({ name, v }: { name: string; v: ValuationHistory }) {
+  const W = 700, H = 120, PAD = 8;
+  const values = [...v.series.map(p => p.pe), ...(v.current != null ? [v.current] : [])];
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const pad = (hi - lo) * 0.1 || 1;
+  const x = (i: number) => PAD + (i / Math.max(v.series.length - 1, 1)) * (W - 2 * PAD);
+  const y = (val: number) => PAD + (1 - (val - (lo - pad)) / (hi - lo + 2 * pad)) * (H - 2 * PAD);
+  const line = v.series.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.pe).toFixed(1)}`).join(" ");
+  const verdict = historyVerdict(v);
+  const shortName = name.replace(/,? (Inc\.?|Corporation|Corp\.?|Company|Co\.)$/i, "");
+
+  return (
+    <div className="card valuation-card">
+      <div className="brief-label">
+        Valuation over time <Info text={EXPLAIN.peHistory} />
+      </div>
+      <p className="valuation-headline">
+        {verdict && <strong>{verdict} for {shortName}.</strong>} P/E is <strong>{v.current ?? "—"}</strong> now vs. a
+        5-year average of <strong>{v.average}</strong> (range {v.low}–{v.high}).
+      </p>
+      <svg className="valuation-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img"
+        aria-label={`P/E over 5 years, between ${v.low} and ${v.high}, average ${v.average}`}>
+        <line x1={PAD} x2={W - PAD} y1={y(v.average)} y2={y(v.average)} className="chart-target" vectorEffect="non-scaling-stroke" />
+        <path d={line} className="valuation-line" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <div className="chart-footer">
+        <span>{fullDate(v.series[0].date)}</span>
+        <span className="chart-target-label">- - 5-year average {v.average}</span>
+        <span>{fullDate(v.series[v.series.length - 1].date)}</span>
+      </div>
+      <p className="peer-source">
+        Based on adjusted earnings (excluding one-off items), as companies report each quarter. This can differ from
+        the P/E at the top of the page, which uses official accounting earnings.
+      </p>
+    </div>
+  );
+}
+
 // ── Competitor comparison ─────────────────────────────────────────────────────
 const peDisplay = (pe: number | null) => (pe == null ? "—" : pe <= 0 ? "loss" : pe.toFixed(1));
 const pctDisplay = (n: number | null) => (n == null ? "—" : pct(n));
-
-function peerSummary(self: Peer, m: Peers["medians"]): string[] {
-  const lines: string[] = [];
-  if (self.forward_pe != null && self.forward_pe > 0 && m.forward_pe != null) {
-    lines.push(
-      self.forward_pe < m.forward_pe * 0.8
-        ? "Priced cheaper than most competitors relative to expected profit."
-        : self.forward_pe > m.forward_pe * 1.2
-        ? "Priced higher than most competitors relative to expected profit — investors expect more from it."
-        : "Priced roughly in line with competitors."
-    );
-  }
-  if (self.revenue_growth_pct != null && m.revenue_growth_pct != null) {
-    const d = self.revenue_growth_pct - m.revenue_growth_pct;
-    lines.push(d > 5 ? "Growing sales faster than its competitors." : d < -5 ? "Growing sales more slowly than its competitors." : "Growing sales at a similar pace to competitors.");
-  }
-  if (self.profit_margin_pct != null && m.profit_margin_pct != null) {
-    const d = self.profit_margin_pct - m.profit_margin_pct;
-    lines.push(d > 5 ? "More profitable than most competitors." : d < -5 ? "Less profitable than most competitors." : "About as profitable as its competitors.");
-  }
-  return lines;
-}
 
 function PeersCard({ result }: { result: Result }) {
   const { peers, stock: s, ticker } = result;
@@ -469,7 +553,7 @@ function PeersCard({ result }: { result: Result }) {
     profit_margin_pct: s.financials.profit_margin_pct,
   };
   const rows = [self, ...peers.companies];
-  const summary = peerSummary(self, peers.medians);
+  const summary = peers.summary ?? [];
 
   return (
     <div className="card peers-card">
@@ -516,7 +600,9 @@ function PeersCard({ result }: { result: Result }) {
         </table>
       </div>
       <p className="peer-source">
-        {peers.source === "finnhub"
+        {peers.source === "finnhub+ai"
+          ? "Competitors from Finnhub's industry list, reviewed by AI to drop companies that don't really compete and add missing ones."
+          : peers.source === "finnhub"
           ? "Competitors from Finnhub's industry peer list (US-listed companies only)."
           : "Competitors suggested by AI, so the list may be imperfect."}{" "}
         "loss" means the company is expected to lose money, so P/E doesn't apply.
@@ -656,7 +742,7 @@ export default function App() {
 
   const Cites = ({ ids }: { ids: number[] }) => {
     if (!result) return null;
-    if (ids.length === 0) return <span className="cite-background">background</span>;
+    if (ids.length === 0) return <span className="cite-background">not from news</span>;
     return (
       <>
         {ids.map(id => {
@@ -684,6 +770,8 @@ export default function App() {
         </div>
         <div className="ratings-legend">
           {buy} Buy · {r.hold} Hold · {sell} Sell
+          <br />
+          {buy + r.hold + sell} ratings this month
         </div>
       </div>
     );
@@ -852,6 +940,7 @@ export default function App() {
                     {s.target_low != null && s.target_high != null && (
                       <div className="stat-sub">
                         {money(s.target_low)} – {money(s.target_high)}
+                        {s.analyst_count != null && ` · ${s.analyst_count} targets`}
                       </div>
                     )}
                     {targetContext(s) && <div className="stat-sub context">{targetContext(s)}</div>}
@@ -859,11 +948,23 @@ export default function App() {
                   <div className="stat">
                     <div className="stat-label">Consensus <Info text={EXPLAIN.consensus} /></div>
                     <div className={consensusClass(s.recommendation)}>{prettyRating(s.recommendation)}</div>
-                    {s.analyst_count != null && <div className="stat-sub">{s.analyst_count} analysts</div>}
-                    {s.ratings && <RatingsBar r={s.ratings} />}
+                    {s.ratings ? (
+                      <RatingsBar r={s.ratings} />
+                    ) : (
+                      s.analyst_count != null && <div className="stat-sub">{s.analyst_count} analysts</div>
+                    )}
                   </div>
                 </div>
               </div>
+
+              {s.upside_pct != null && s.upside_pct < 0 && s.target_mean != null && (
+                <div className="notice">
+                  <strong>Already above the analysts' target.</strong> The price ({money(s.price)}) has passed the average
+                  analyst target ({money(s.target_mean)}). That can happen after a strong run: analysts may raise their
+                  targets, or some may downgrade the stock. The "{prettyRating(s.recommendation)}" rating may lag behind the
+                  price.
+                </div>
+              )}
 
               <div className="metrics">
                 <div>
@@ -892,6 +993,11 @@ export default function App() {
                   {peContext(s.trailing_pe, s.forward_pe, s.financials.profit_margin_pct, result.peers?.medians.forward_pe) && (
                     <div className="context">
                       {peContext(s.trailing_pe, s.forward_pe, s.financials.profit_margin_pct, result.peers?.medians.forward_pe)}
+                    </div>
+                  )}
+                  {s.valuation_history && historyVerdict(s.valuation_history) && (
+                    <div className="context">
+                      {historyVerdict(s.valuation_history)} (5-yr avg {s.valuation_history.average})
                     </div>
                   )}
                 </div>
@@ -982,7 +1088,7 @@ export default function App() {
             <div className="card health-card">
               <div className="brief-label">Financial health</div>
               <div className="health-grid">
-                {healthItems(s.financials).map(item => (
+                {healthItems(s.financials, s.shareholder_returns).map(item => (
                   <div key={item.label} className={"health-item " + item.verdict}>
                     <div className="health-label">
                       {item.label} <Info text={item.info} />
@@ -1026,6 +1132,49 @@ export default function App() {
                 </section>
               )}
 
+              {s.insiders && (
+                <section className="insiders">
+                  <h3>
+                    Insider trading, last 6 months <Info text={EXPLAIN.insiders} />
+                  </h3>
+                  {s.insiders.sales + s.insiders.purchases === 0 ? (
+                    <p className="earnings-summary">No open-market trades by executives or directors.</p>
+                  ) : (
+                    <>
+                      <p className="earnings-summary">
+                        {s.insiders.purchases > 0 && (
+                          <>
+                            <strong className="green-text">Bought {bigNumber(s.insiders.bought)}</strong> in {s.insiders.purchases} trade
+                            {s.insiders.purchases > 1 ? "s" : ""}
+                            {s.insiders.sales > 0 ? " · " : ". "}
+                          </>
+                        )}
+                        {s.insiders.sales > 0 && (
+                          <>
+                            <strong>Sold {bigNumber(s.insiders.sold)}</strong> in {s.insiders.sales} trade{s.insiders.sales > 1 ? "s" : ""}.{" "}
+                          </>
+                        )}
+                        <span className="muted-inline">
+                          {s.insiders.purchases > 0
+                            ? "Insider buying is relatively rare and often read as confidence."
+                            : "Selling is common and often routine (taxes, diversification)."}
+                        </span>
+                      </p>
+                      <ul className="insider-list">
+                        {s.insiders.recent.map((t, i) => (
+                          <li key={i}>
+                            <span className={t.type === "purchase" ? "green-text" : ""}>{t.type === "purchase" ? "Bought" : "Sold"}</span>{" "}
+                            {t.value ? bigNumber(t.value) : ""} · {t.name}
+                            {t.position && <span className="muted-inline">, {t.position}</span>}
+                            <span className="muted-inline"> · {shortDate(t.date)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </section>
+              )}
+
               <div className="fin-links">
                 <span>Full financial statements:</span>
                 {s.links.income_statement && <a href={s.links.income_statement} target="_blank" rel="noreferrer">Income statement</a>}
@@ -1036,32 +1185,55 @@ export default function App() {
               </div>
             </div>
 
+            {s.valuation_history && s.valuation_history.series.length > 1 && (
+              <ValuationCard name={s.name} v={s.valuation_history} />
+            )}
+
             <PeersCard result={result} />
 
             <div className="card sources-card">
               <div className="brief-label">
-                Sources · {result.articles.length} articles from{" "}
-                {new Set(result.articles.map(a => (/yahoo/i.test(a.source) ? "yahoo" : a.source))).size} publishers
+                Sources · {result.articles.filter(a => !a.same_story_as).length} stories, {result.articles.length} articles from{" "}
+                {new Set(result.articles.map(a => a.source)).size} publishers
               </div>
               {result.articles.length === 0 && <p className="muted">No recent articles found.</p>}
               <ol className="source-list">
-                {result.articles.map(a => (
-                  <li key={a.id}>
-                    <span className="source-id">{a.id}</span>
-                    <span className={"dot " + a.sentiment} title={a.sentiment} />
-                    <a href={a.link} target="_blank" rel="noreferrer">{a.title}</a>
-                    <span className="source-meta">
-                      {a.source}
-                      {a.published && " · " + shortDate(a.published)}
-                    </span>
-                  </li>
-                ))}
+                {result.articles
+                  .filter(a => !a.same_story_as)
+                  .map(a => {
+                    const alsoCovered = result.articles.filter(o => o.same_story_as === a.id);
+                    return (
+                      <li key={a.id}>
+                        <span className="source-id">{a.id}</span>
+                        <span className={"dot " + a.sentiment} title={a.sentiment} />
+                        <a href={a.link} target="_blank" rel="noreferrer">{a.title}</a>
+                        <span className="source-meta">
+                          {a.source}
+                          {a.published && " · " + shortDate(a.published)}
+                        </span>
+                        {alsoCovered.length > 0 && (
+                          <div className="also-covered">
+                            Same story:{" "}
+                            {alsoCovered.map((o, i) => (
+                              <span key={o.id}>
+                                {i > 0 && ", "}
+                                <a href={o.link} target="_blank" rel="noreferrer" title={o.title}>
+                                  <span className="source-id">{o.id}</span> {o.source}
+                                </a>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
               </ol>
             </div>
 
             <p className="disclaimer">
               AI-generated summary of public news and analyst data. May contain errors. Not financial advice.
-              "Background" marks points from the model's general knowledge rather than the linked articles.
+              "Not from news" marks points based on the financial data on this page or the model's general knowledge
+              rather than a linked article.
             </p>
           </div>
         )}

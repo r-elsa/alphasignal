@@ -55,6 +55,7 @@ class Brief(BaseModel):
     bear_case: List[Point] = Field(description="2-3 specific risks for this company. No generic market risks.")
     watch: List[str] = Field(description="2-4 upcoming catalysts or open questions to watch, with dates when known.")
     article_sentiment: List[ArticleSentiment] = Field(description="One entry per article provided.")
+    story_groups: List[List[int]] = Field(description="Groups of article IDs that report the same specific news item: the same announcement, the same analyst note, the same comments by the same person. Articles that only share a theme (e.g. two different iPhone stories) are NOT the same story. Only groups of 2 or more; each ID in at most one group. When in doubt, don't group.")
     sentiment_summary: str = Field(description="One sentence on the tone of the news, and whether it agrees with the analyst consensus.")
 
 
@@ -66,11 +67,61 @@ def _num(value, digits=2):
     return None
 
 
+def _person_name(raw: str) -> str:
+    """SEC filings list names as 'NEWSTEAD JENNIFER' or 'FORD WILLIAM CLAY JR' -> 'Jennifer Newstead', 'William Clay Ford Jr'."""
+    parts = raw.split()
+    if len(parts) < 2:
+        return raw.title()
+    suffix = [p for p in parts[1:] if p.rstrip(".").upper() in {"JR", "SR", "II", "III", "IV"}]
+    rest = [p for p in parts[1:] if p not in suffix]
+    return " ".join(rest + parts[:1] + suffix).title().replace("Iii", "III").replace("Ii", "II").replace("Iv", "IV")
+
+
 def _published(entry) -> Optional[str]:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
         return None
     return datetime.datetime.fromtimestamp(calendar.timegm(parsed), tz=datetime.timezone.utc).isoformat()
+
+
+def _valuation_history(stock, price: Optional[float]) -> Optional[dict]:
+    """Trailing P/E over the last 5 years: price on each date / sum of the 4 quarterly EPS reported before it."""
+    ed = stock.get_earnings_dates(limit=32)
+    if ed is None or ed.empty or not price:
+        return None
+    eps = ed["Reported EPS"].dropna()
+    reports = sorted((idx.tz_localize(None) if idx.tzinfo else idx, float(v)) for idx, v in eps.items())
+    if len(reports) < 8:
+        return None
+
+    def ttm_eps(at):
+        before = [v for d, v in reports if d <= at][-4:]
+        return sum(before) if len(before) == 4 else None
+
+    # Split-adjusted but not dividend-adjusted prices, so they match reported EPS
+    prices = stock.history(period="5y", interval="1mo", auto_adjust=False)["Close"].dropna()
+    series, skipped = [], 0
+    for idx, close in prices.items():
+        at = idx.tz_localize(None) if idx.tzinfo else idx
+        e = ttm_eps(at)
+        if e is None or e <= 0 or close / e > 300:
+            skipped += 1  # losses or near-zero profit make P/E meaningless
+            continue
+        series.append({"date": at.date().isoformat(), "pe": round(float(close) / e, 1)})
+    if len(series) < max(12, 0.6 * len(prices)):
+        return None
+
+    current_eps = ttm_eps(datetime.datetime.now())
+    current = round(price / current_eps, 1) if current_eps and current_eps > 0 else None
+    values = sorted(p["pe"] for p in series)
+    return {
+        "current": current,
+        "average": round(statistics.mean(values), 1),
+        "low": values[0],
+        "high": values[-1],
+        "series": series,
+        "months_skipped": skipped,
+    }
 
 
 # ── Agent 1: Scraper ──────────────────────────────────────────────────────────
@@ -79,6 +130,45 @@ MAX_ARTICLES = 20
 MAX_PER_PUBLISHER = 3
 GENERIC_WORDS = {"bank", "first", "general", "american", "united", "international", "global", "national", "new", "the"}
 QUOTE_PAGE = re.compile(r"stock price, news, quote|stock quote|price, news, quote", re.I)
+# Recurring low-value formats: fund holding changes, auto-generated "facts" posts, "$1,000 invested" bait
+FILLER = re.compile(
+    r"|".join([
+        r"\b(stock|shares|stake|position|holdings?)\b.{0,40}\b(acquired|sold|bought|purchased|boosted|trimmed|lowered|raised|increased|decreased|cut|reduced) by\b",
+        r"\bis (up|down) [\d.]+% today, on\b",
+        r"how long would it take \$",
+        r"if you (had )?invested \$",
+        r"\$[\d,]+ invest(ed|ment).{0,40}(worth|become)",
+        r"(exceeds|lags|trails|outpaces|beats) (the )?market returns",
+        r"some facts to (consider|know)",
+        r"facts to know before betting",
+        r"is a trending stock",
+        r"is attracting investor attention",
+        r"here is what you should know",
+        r"\bstock (jumps|falls|rises|drops|gaps (up|down)|trading (up|down)) [\d.]+%.{0,10}(what's next|here's why)",
+        r"price history for",
+        r"institutional ownership",
+        r"short interest",
+    ]),
+    re.I,
+)
+PUBLISHER_NAMES = {"fool": "The Motley Fool", "thestreet": "TheStreet", "investing": "Investing.com", "barchart": "Barchart", "cnbc": "CNBC"}
+
+
+def _publisher(source: str) -> str:
+    """Merge variants like 'Yahoo Finance Australia' or 'fool.com' into one display name."""
+    s = source.lower()
+    if "yahoo" in s:
+        return "Yahoo Finance"
+    for key, name in PUBLISHER_NAMES.items():
+        if key in s:
+            return name
+    return source
+
+
+def _title_words(title: str, ticker: str) -> set:
+    t = re.sub(r"\([^)]*\)", " ", title.lower())  # drop "(AAPL)", "(NASDAQ:AAPL)"
+    t = re.sub(rf"\$?\b{re.escape(ticker.lower())}\b", " ", t)
+    return set(re.findall(r"[a-z0-9]+", t))
 
 
 def _short_name(name: str) -> str:
@@ -131,7 +221,7 @@ def scraper_agent(state: AgentState) -> AgentState:
                     "title": title,
                     "summary": re.sub(r"<[^>]+>", "", summary)[:300],
                     "link": entry.get("link", ""),
-                    "source": source,
+                    "source": _publisher(source),
                     "published": _published(entry),
                 })
         except Exception as e:
@@ -149,21 +239,22 @@ def scraper_agent(state: AgentState) -> AgentState:
         a for a in articles
         if (name_pattern.search(a["title"] + " " + a["summary"]) or ticker_re.search(a["title"] + " " + a["summary"]))
         and not QUOTE_PAGE.search(a["title"])
+        and not FILLER.search(a["title"])
     ]
 
     # Deduplicate by title, newest first, and cap each publisher so no single one dominates
     articles.sort(key=lambda a: a["published"] or "", reverse=True)
-    seen = set()
+    seen = []
     per_publisher = {}
     unique_articles = []
     for a in articles:
-        key = re.sub(r"\W+", "", a["title"].lower())
-        publisher = a["source"].lower().replace(".com", "")
-        if "yahoo" in publisher:
-            publisher = "yahoo"  # Yahoo Finance UK/Canada/Singapore count as one publisher
-        if key in seen or per_publisher.get(publisher, 0) >= MAX_PER_PUBLISHER:
+        words = _title_words(a["title"], ticker)
+        # Same story with a slightly different headline counts as a duplicate
+        duplicate = any(len(words & w) / max(len(words | w), 1) >= 0.75 for w in seen)
+        publisher = a["source"]
+        if not words or duplicate or per_publisher.get(publisher, 0) >= MAX_PER_PUBLISHER:
             continue
-        seen.add(key)
+        seen.append(words)
         per_publisher[publisher] = per_publisher.get(publisher, 0) + 1
         unique_articles.append(a)
         if len(unique_articles) >= MAX_ARTICLES:
@@ -222,6 +313,68 @@ def consensus_agent(state: AgentState) -> AgentState:
     except Exception as e:
         print(f"[Consensus Agent] No earnings history: {e}")
 
+    shareholder_returns = None
+    try:
+        cf = stock.ttm_cashflow
+        if cf is None or cf.empty:
+            cf = stock.cashflow
+        if cf is not None and not cf.empty:
+            col = cf.iloc[:, 0]
+            def _row(name):
+                value = col.get(name)
+                return abs(float(value)) if value is not None and value == value else 0.0
+            buybacks, dividends = _row("Repurchase Of Capital Stock"), _row("Cash Dividends Paid")
+            market_cap = info.get("marketCap")
+            if buybacks or dividends:
+                shareholder_returns = {
+                    "buybacks": buybacks,
+                    "dividends": dividends,
+                    "yield_pct": _num((buybacks + dividends) / market_cap * 100, 1) if market_cap else None,
+                }
+    except Exception as e:
+        print(f"[Consensus Agent] No cash flow data: {e}")
+
+    insiders = None
+    try:
+        it = stock.insider_transactions
+        if it is not None and not it.empty:
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=183)
+            sold = bought = 0.0
+            sales = purchases = 0
+            recent = []
+            for _, row in it.iterrows():
+                text = str(row.get("Text") or "")
+                started = row.get("Start Date")
+                when = started.to_pydatetime() if hasattr(started, "to_pydatetime") else None
+                if when is None or when.replace(tzinfo=None) < cutoff:
+                    continue
+                # Only open-market trades count; stock grants, gifts and option exercises are routine
+                is_sale, is_buy = text.startswith("Sale at price"), text.startswith("Purchase at price")
+                if not (is_sale or is_buy):
+                    continue
+                value = float(row.get("Value") or 0) if row.get("Value") == row.get("Value") else 0.0
+                if is_sale:
+                    sold, sales = sold + value, sales + 1
+                else:
+                    bought, purchases = bought + value, purchases + 1
+                if len(recent) < 4:
+                    recent.append({
+                        "name": _person_name(str(row.get("Insider") or "")),
+                        "position": str(row.get("Position") or ""),
+                        "type": "sale" if is_sale else "purchase",
+                        "value": value,
+                        "date": when.date().isoformat(),
+                    })
+            insiders = {"sold": sold, "bought": bought, "sales": sales, "purchases": purchases, "recent": recent}
+    except Exception as e:
+        print(f"[Consensus Agent] No insider data: {e}")
+
+    valuation_history = None
+    try:
+        valuation_history = _valuation_history(stock, price)
+    except Exception as e:
+        print(f"[Consensus Agent] No valuation history: {e}")
+
     def _pct(key):
         value = _num(info.get(key), 4)
         return round(value * 100, 1) if value is not None else None
@@ -273,6 +426,9 @@ def consensus_agent(state: AgentState) -> AgentState:
         "financials": financials,
         "earnings_history": earnings_history,
         "links": links,
+        "shareholder_returns": shareholder_returns,
+        "insiders": insiders,
+        "valuation_history": valuation_history,
     }
     print(f"[Consensus Agent] Got data: {stock_info['recommendation']} from {stock_info['analyst_count']} analysts")
     return {"stock_info": stock_info}
@@ -304,11 +460,21 @@ def _peer_candidates_finnhub(ticker: str) -> List[str]:
         return []
 
 
-def _peer_candidates_llm(ticker: str, name: str, sector: Optional[str]) -> List[str]:
+def _peer_candidates_llm(ticker: str, name: str, sector: Optional[str], description: str, suggested: List[str]) -> List[str]:
+    review = (
+        f"An industry database suggests these peers: {', '.join(suggested)}. Databases often group companies by "
+        "a broad industry code, so some may not really compete. Keep the ones that do, drop the ones that don't, "
+        "and add obvious major competitors that are missing.\n"
+        if suggested else ""
+    )
     try:
         result: PeerList = llm.with_structured_output(PeerList).invoke([HumanMessage(content=(
-            f"List the 6 closest publicly traded competitors of {name} ({ticker}), sector: {sector or 'unknown'}. "
-            "Prefer large, well-known US-listed companies in the same line of business. Return ticker symbols only."
+            f"Company: {name} ({ticker}), sector: {sector or 'unknown'}.\n"
+            f"What it does: {description[:600] or 'unknown'}\n\n"
+            f"{review}"
+            "Return the 6 closest direct competitors that an investor would compare it with, most relevant first. "
+            "They must trade in the US: use the US ticker, or the US ADR ticker for foreign companies (e.g. TM for Toyota). "
+            "Return ticker symbols only."
         ))])
         return result.tickers
     except Exception as e:
@@ -341,24 +507,51 @@ def peers_agent(state: AgentState) -> AgentState:
     s = state["stock_info"]
     print(f"[Peers Agent] Finding competitors for {ticker}...")
 
-    candidates, source = _peer_candidates_finnhub(ticker), "finnhub"
-    if len(candidates) <= 1:
-        candidates, source = _peer_candidates_llm(ticker, s["name"], s.get("sector")), "ai"
+    # Finnhub groups by broad industry code (Apple -> Dell, Western Digital), so the AI reviews its list
+    finnhub = [t for t in _peer_candidates_finnhub(ticker) if t.upper() != ticker]
+    reviewed = _peer_candidates_llm(ticker, s["name"], s.get("sector"), s.get("business_summary", ""), finnhub[:10])
+    if reviewed:
+        candidates, source = reviewed, ("finnhub+ai" if finnhub else "ai")
+    else:
+        candidates, source = finnhub, "finnhub"
 
-    candidates = [t.upper().strip() for t in candidates if t.upper().strip() != ticker][: MAX_PEERS + 3]
+    candidates = list(dict.fromkeys(t.upper().strip() for t in candidates if t.upper().strip() != ticker))[: MAX_PEERS + 3]
     with concurrent.futures.ThreadPoolExecutor() as executor:
         metrics = [m for m in executor.map(_peer_metrics, candidates) if m]
-    # Keep the biggest, most recognisable competitors
-    metrics.sort(key=lambda m: m["market_cap"], reverse=True)
-    peers = metrics[:MAX_PEERS]
+    # Keep the reviewer's relevance order
+    # Tiny companies (e.g. HP next to Apple) distort the comparison; keep the filter only if enough peers remain
+    big_enough = [m for m in metrics if s.get("market_cap") and m["market_cap"] >= 0.01 * s["market_cap"]]
+    peers = (big_enough if len(big_enough) >= 2 else metrics)[:MAX_PEERS]
 
     def median(key):
         values = [p[key] for p in peers if p[key] is not None and (key not in ("trailing_pe", "forward_pe") or p[key] > 0)]
         return round(statistics.median(values), 1) if values else None
 
     medians = {k: median(k) for k in ["forward_pe", "trailing_pe", "revenue_growth_pct", "profit_margin_pct", "change_1y_pct"]}
+    summary = _peer_summary(s, medians)
     print(f"[Peers Agent] {len(peers)} peers via {source}: {[p['ticker'] for p in peers]}")
-    return {"peers": {"source": source, "companies": peers, "medians": medians}}
+    return {"peers": {"source": source, "companies": peers, "medians": medians, "summary": summary}}
+
+
+def _peer_summary(s: dict, m: dict) -> List[str]:
+    """Plain verdicts vs. competitors. The page shows these and the brief is told to reuse them, so they never disagree."""
+    lines = []
+    fwd, f = s.get("forward_pe"), s.get("financials", {})
+    if fwd is not None and fwd > 0 and m.get("forward_pe"):
+        lines.append(
+            "Priced cheaper than most competitors relative to expected profit." if fwd < m["forward_pe"] * 0.8
+            else "Priced higher than most competitors relative to expected profit — investors expect more from it." if fwd > m["forward_pe"] * 1.2
+            else "Priced roughly in line with competitors."
+        )
+    growth, mg = f.get("revenue_growth_pct"), m.get("revenue_growth_pct")
+    if growth is not None and mg is not None:
+        d = growth - mg
+        lines.append("Growing sales faster than its competitors." if d > 5 else "Growing sales more slowly than its competitors." if d < -5 else "Growing sales at a similar pace to competitors.")
+    margin, mm = f.get("profit_margin_pct"), m.get("profit_margin_pct")
+    if margin is not None and mm is not None:
+        d = margin - mm
+        lines.append("More profitable than most competitors." if d > 5 else "Less profitable than most competitors." if d < -5 else "About as profitable as its competitors.")
+    return lines
 
 
 # ── Agent 4: Report ───────────────────────────────────────────────────────────
@@ -383,6 +576,10 @@ The reader can ALREADY SEE these numbers on screen. Use them for reasoning, but 
 - Next earnings date: {s['next_earnings'] or 'unknown'}
 - Financials: revenue growth {s['financials']['revenue_growth_pct']}% (year over year), profit margin {s['financials']['profit_margin_pct']}%, cash ${s['financials']['total_cash']}, debt ${s['financials']['total_debt']}, free cash flow ${s['financials']['free_cash_flow']}
 - Competitors ({', '.join(p['ticker'] for p in state['peers']['companies']) or 'unknown'}) median: forward P/E {state['peers']['medians'].get('forward_pe')}, revenue growth {state['peers']['medians'].get('revenue_growth_pct')}%, profit margin {state['peers']['medians'].get('profit_margin_pct')}%
+- Verdicts vs. competitors shown on the page (if you compare with competitors, use exactly these conclusions): {' '.join(state['peers'].get('summary', [])) or 'none'}
+- Valuation vs. its own history: {(f"trailing P/E {s['valuation_history']['current']} now vs. 5-year average {s['valuation_history']['average']} (range {s['valuation_history']['low']}–{s['valuation_history']['high']})") if s.get('valuation_history') else 'unknown'}
+- Returned to shareholders last 12 months: {s['shareholder_returns'] or 'unknown'}
+- Insider open-market trades, last 6 months: {({k: s['insiders'][k] for k in ('sold', 'bought', 'sales', 'purchases')} if s['insiders'] else 'unknown')}
 - Last quarters' earnings surprise vs. estimates (%): {[q['surprise_pct'] for q in s['earnings_history']] or 'unknown'}
 
 COMPANY BUSINESS SUMMARY (for the company description only):
@@ -394,8 +591,9 @@ RECENT ARTICLES (cite by ID):
 Rules:
 - Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles and long-range price predictions.
 - Every development must cite at least one article ID. Never cite an ID that is not in the list.
-- Bull and bear points must be specific to this company. Do not write generic risks like "market volatility" or "economic uncertainty". Prefer points supported by the articles; if you use general background knowledge, leave source_ids empty.
-- Classify the sentiment of every article towards the stock.
+- Bull and bear points must be specific to this company. Do not write generic risks like "market volatility" or "economic uncertainty". Prefer points supported by the articles; if a point comes from the financial data above or general background knowledge, leave source_ids empty.
+- Facts in the articles beat your background knowledge, which may be out of date. Copy names, job titles, numbers and dates exactly as the articles state them; never "correct" an article from memory. If you are unsure what an event is, say so plainly instead of writing around it.
+- Classify the sentiment of every article towards the stock, and group articles that report the same story.
 - Write for a beginner investor: short sentences, plain English. If a finance or industry term is unavoidable, explain it in a few words in parentheses, e.g. "hyperscalers (the big cloud companies like Microsoft and Amazon)".
 - Be concise. No filler, no introductions."""
 
@@ -413,6 +611,17 @@ Rules:
     for a in articles:
         a["sentiment"] = labels.get(a["id"], "neutral")
     counts = {k: sum(1 for a in articles if a["sentiment"] == k) for k in ["positive", "negative", "neutral"]}
+
+    # Same-story groups: the newest article (lowest ID) leads, the others are listed under it
+    grouped = set()
+    for group in brief.story_groups:
+        ids = sorted(i for i in dict.fromkeys(group) if i in valid_ids and i not in grouped)
+        if len(ids) < 2:
+            continue
+        grouped.update(ids)
+        for a in articles:
+            if a["id"] in ids[1:]:
+                a["same_story_as"] = ids[0]
 
     print(f"[Report Agent] Brief generated")
     return {"brief": {

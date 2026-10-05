@@ -1066,3 +1066,93 @@ body {
   margin-top: 10px;
   line-height: 1.5;
 }
+
+/* ── Price vs. target notice ── */
+.notice {
+  margin-top: 18px;
+  padding: 12px 14px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #78350f;
+}
+
+/* ── Insider trading ── */
+.insiders {
+  margin-top: 24px;
+}
+
+.insiders h3 {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.insiders h3 .info-tip {
+  right: auto;
+  left: -8px;
+}
+
+.muted-inline {
+  color: #6b7280;
+}
+
+.insider-list {
+  list-style: none;
+  font-size: 13px;
+  color: #374151;
+}
+
+.insider-list li {
+  padding: 4px 0;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.insider-list li:last-child {
+  border-bottom: none;
+}
+
+/* ── Valuation history ── */
+.valuation-headline {
+  font-size: 14px;
+  color: #374151;
+  line-height: 1.55;
+  margin-bottom: 10px;
+}
+
+.valuation-chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+
+.valuation-line {
+  fill: none;
+  stroke: #2563eb;
+  stroke-width: 2;
+}
+
+/* ── Same-story grouping in sources ── */
+.also-covered {
+  flex-basis: 100%;
+  padding-left: 33px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.also-covered a {
+  color: #6b7280;
+  text-decoration: none;
+  flex: none;
+  min-width: 0;
+}
+
+.also-covered a:hover {
+  text-decoration: underline;
+}
+
+.also-covered .source-id {
+  min-width: 0;
+}
