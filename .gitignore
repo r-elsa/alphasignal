@@ -1,0 +1,22 @@
+# Secrets — never commit API keys
+.env
+.env.*
+!.env.example
+
+# Python
+backend/venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+frontend/build/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local backups
+*.bak
