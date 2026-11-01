@@ -8,3 +8,6 @@ pydantic==2.13.5
 langchain-core==0.3.86
 langchain-openai==0.3.35
 langgraph==0.6.11
+SQLAlchemy==2.0.54
+psycopg[binary]==3.2.13
+alembic==1.16.5

@@ -1,0 +1,21 @@
+# Local PostgreSQL for AlphaSignal. Start it with: docker compose up -d
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-alphasignal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-alphasignal}  # local development only
+      POSTGRES_DB: ${POSTGRES_DB:-alphasignal}
+    ports:
+      - "127.0.0.1:5432:5432"  # only reachable from this computer
+    volumes:
+      - pgdata:/var/lib/postgresql/data  # data survives container restarts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -13,18 +13,37 @@ Enter a company or ticker and get everything that matters in one page: live pric
 - **AI brief**: what happened, bull and bear case, what to watch, and news sentiment, each point cited
 - **News** from Google News, Seeking Alpha, Nasdaq and Yahoo Finance, filtered for relevance and capped per publisher
 - Live progress while the agents work, 15-minute caching, and shareable links (`?t=NVDA`)
+- **My portfolio**: save your holdings (shares and purchase price) in PostgreSQL and see value, gain/loss, today's move and weights in EUR
 
 ## How it works
 
-A FastAPI backend runs a small multi-agent pipeline:
+The analysis is a [LangGraph](https://langchain-ai.github.io/langgraph/) graph of four agents that share one state:
 
-1. **Market agent** fetches price, analyst data, financials and earnings history (yfinance)
-2. **News agent** and **Peers agent** run in parallel: RSS feeds, and competitors via Finnhub
-3. **Report agent** writes a structured brief with an OpenAI model and cites articles by ID
+```mermaid
+graph LR
+    start([start]) --> market[Market agent<br/>price, analysts, financials]
+    market --> news[News agent<br/>news from many publishers]
+    market --> peers[Peers agent<br/>competitors]
+    news --> report[Report agent<br/>cited AI brief]
+    peers --> report
+    report --> done([end])
+```
 
-Progress is streamed to the React frontend with Server-Sent Events.
+1. **Market agent** fetches price, analyst data, financials, earnings history and insider trades (yfinance). It runs first because the others need the company name.
+2. **News agent** and **Peers agent** run in parallel: news from Google News (also in the stock's home-market language), Yahoo Finance, Seeking Alpha and Nasdaq; competitors from Finnhub, reviewed by AI.
+3. **Report agent** waits for both, then writes a structured brief with an OpenAI model, citing articles by ID.
+
+Each agent retries on network and API errors (up to 3 attempts with backoff); an unknown ticker fails immediately. Progress is streamed to the React frontend with Server-Sent Events. To print the graph: `python pipeline.py --graph`.
+
+The portfolio and morning-email settings are stored in PostgreSQL (run with Docker Compose) through SQLAlchemy, with Alembic migrations applied on startup.
 
 ## Running locally
+
+**Database** (Docker, e.g. Rancher Desktop or Docker Desktop)
+
+```bash
+docker compose up -d
+```
 
 **Backend** (Python 3.9+)
 

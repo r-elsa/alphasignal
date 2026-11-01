@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
+import Portfolio from "./Portfolio";
+import { API, bigNumber, currencySymbol, Info, money, pct, signed, toneClass } from "./shared";
 
 interface Ratings {
   strongBuy: number;
@@ -142,35 +144,6 @@ interface Result {
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
-// Prices use the stock's trading currency (London quotes in pence, "GBp"); financials can use another currency
-const currencySymbol = (currency: string) => {
-  try {
-    const part = new Intl.NumberFormat("en-US", { style: "currency", currency }).formatToParts(0).find(p => p.type === "currency");
-    const sym = part?.value ?? currency;
-    return /^[A-Z]{2,3}$/.test(sym) ? sym + " " : sym; // "SEK 12" reads better than "SEK12"
-  } catch {
-    return currency + " ";
-  }
-};
-
-const money = (n: number | null, currency = "USD") => {
-  if (n == null) return "—";
-  if (currency === "GBp") return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "p";
-  const digits = ["JPY", "KRW"].includes(currency) ? 0 : 2;
-  return currencySymbol(currency) + n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
-};
-
-const signed = (n: number, suffix = "") => (n > 0 ? "+" : "") + n.toFixed(2) + suffix;
-
-const bigNumber = (n: number | null, currency = "USD") => {
-  if (n == null) return "—";
-  const sym = currencySymbol(currency === "GBp" ? "GBP" : currency);
-  if (n >= 1e12) return sym + (n / 1e12).toFixed(2) + "T";
-  if (n >= 1e9) return sym + (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return sym + (n / 1e6).toFixed(1) + "M";
-  return sym + Math.round(n).toLocaleString("en-US");
-};
-
 const prettyRating = (r: string | null) =>
   r ? r.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()) : "—";
 
@@ -227,7 +200,6 @@ const EXPLAIN: Record<string, string> = {
 
 type Verdict = "good" | "ok" | "bad" | "neutral";
 
-const pct = (n: number) => (n > 0 ? "+" : "") + n.toFixed(1) + "%";
 
 const monthYear = (iso: string) =>
   new Date(iso + "T00:00:00").toLocaleDateString("en-US", { month: "short", year: "numeric" });
@@ -400,15 +372,7 @@ const healthItems = (f: Financials, returns: Stock["shareholder_returns"], cur: 
 
 const VERDICT_ICON: Record<Verdict, string> = { good: "✓", ok: "•", bad: "!", neutral: "" };
 
-const Info = ({ text }: { text: string }) => (
-  <span className="info" tabIndex={0} aria-label={text}>
-    ⓘ<span className="info-tip" role="tooltip">{text}</span>
-  </span>
-);
 
-const toneClass = (n: number | null) => (n == null ? "" : n > 0 ? "green" : n < 0 ? "red" : "");
-
-const API = "http://localhost:8000";
 
 // ── Price chart ───────────────────────────────────────────────────────────────
 interface PricePoint {
@@ -691,7 +655,12 @@ interface Suggestion {
   type: string;
 }
 
+type View = "analyse" | "portfolio";
+
 export default function App() {
+  const [view, setView] = useState<View>(() =>
+    new URLSearchParams(window.location.search).get("view") === "portfolio" ? "portfolio" : "analyse"
+  );
   const [ticker, setTicker] = useState("");
   const [result, setResult] = useState<Result | null>(null);
   const [loading, setLoading] = useState(false);
@@ -749,6 +718,7 @@ export default function App() {
     setError("");
     const target = exact ? input.toUpperCase() : await resolveTicker(input);
     setTicker(target);
+    setView("analyse");
     window.history.replaceState(null, "", `?t=${encodeURIComponent(target)}`);
     setResult(null);
     setSteps({});
@@ -808,6 +778,12 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const showView = (v: View) => {
+    setView(v);
+    const url = v === "portfolio" ? "?view=portfolio" : result ? `?t=${encodeURIComponent(result.ticker)}` : window.location.pathname;
+    window.history.replaceState(null, "", url);
+  };
+
   const consensusClass = (c: string | null) => {
     if (!c) return "stat-value";
     if (c.includes("buy")) return "stat-value green";
@@ -861,9 +837,20 @@ export default function App() {
         <span className="header-icon">⚡</span>
         <span className="header-logo">AlphaSignal</span>
         <span className="header-subtitle">AI Investment Intelligence</span>
+        <nav className="header-nav">
+          <button className={view === "analyse" ? "active" : ""} onClick={() => showView("analyse")}>
+            Analyse
+          </button>
+          <button className={view === "portfolio" ? "active" : ""} onClick={() => showView("portfolio")}>
+            My portfolios
+          </button>
+        </nav>
       </header>
 
       <main className="main">
+        {view === "portfolio" && <Portfolio onAnalyse={t => analyze(t, false, true)} />}
+        {view === "analyse" && (
+        <>
         <div className="hero">
           <h1>Enter a ticker. Get everything that matters.</h1>
           <p>Latest news, analyst consensus and an AI brief with every claim linked to its source.</p>
@@ -1317,6 +1304,8 @@ export default function App() {
               rather than a linked article.
             </p>
           </div>
+        )}
+        </>
         )}
       </main>
     </div>

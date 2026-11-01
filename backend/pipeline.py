@@ -12,7 +12,9 @@ import yfinance as yf
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-from langgraph.graph import StateGraph, END
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import RetryPolicy
 from pydantic import BaseModel, Field
 from typing import Callable, List, Literal, Optional, TypedDict
 import concurrent.futures
@@ -24,12 +26,13 @@ llm = ChatOpenAI(model="gpt-5.5", reasoning_effort="low")
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-class AgentState(TypedDict):
-    ticker: str
-    articles: list
-    stock_info: dict
-    peers: dict
-    brief: dict
+class AgentState(TypedDict, total=False):
+    """Shared state that flows through the agent graph. Each agent fills in its own key."""
+    ticker: str        # input
+    stock_info: dict   # market agent
+    articles: list     # news agent (the report agent adds sentiment and story groups)
+    peers: dict        # peers agent
+    brief: dict        # report agent
 
 
 # ── Brief schema (the LLM must return exactly this) ──────────────────────────
@@ -748,7 +751,7 @@ Rules:
                 a["same_story_as"] = ids[0]
 
     print(f"[Report Agent] Brief generated")
-    return {"brief": {
+    return {"articles": articles, "brief": {
         "company_description": brief.company_description,
         "tldr": brief.tldr,
         "developments": [d.model_dump() for d in brief.developments],
@@ -759,76 +762,104 @@ Rules:
     }}
 
 
+# ── Agent graph (LangGraph) ───────────────────────────────────────────────────
+#
+#            ┌─> news ──┐
+#   market ──┤          ├──> report
+#            └─> peers ─┘
+#
+# The market agent runs first because the others need the company name. News and
+# peers don't depend on each other, so LangGraph runs them in parallel; the report
+# agent waits for both. Each node retries on network and API errors.
+
+def _progress(config: RunnableConfig, step: str, status: str, detail: str = "") -> None:
+    """Report progress to the UI ("running" / "done"), if the caller asked for it."""
+    on_step = (config or {}).get("configurable", {}).get("on_step")
+    if on_step:
+        on_step(step, status, detail)
+
+
+def market_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "market", "running")
+    result = consensus_agent(state)
+    if result["stock_info"]["price"] is None:
+        # ValueError is not retried: the ticker simply doesn't exist
+        raise ValueError(f"No market data found for {state['ticker']}")
+    _progress(config, "market", "done", result["stock_info"]["name"])
+    return result
+
+
+def news_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "news", "running")
+    result = scraper_agent(state)
+    publishers = {a["source"] for a in result["articles"]}
+    _progress(config, "news", "done", f"{len(result['articles'])} articles from {len(publishers)} publishers")
+    return result
+
+
+def peers_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "peers", "running")
+    result = peers_agent(state)
+    _progress(config, "peers", "done", ", ".join(p["ticker"] for p in result["peers"]["companies"]))
+    return result
+
+
+def report_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "brief", "running")
+    result = report_agent(state)
+    _progress(config, "brief", "done")
+    return result
+
+
+# Network hiccups (Yahoo, news feeds, OpenAI) are retried with backoff: 1s, then 2s
+NETWORK_RETRY = RetryPolicy(max_attempts=3, initial_interval=1.0, backoff_factor=2.0)
+
+
+def build_agent_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("market", market_node, retry_policy=NETWORK_RETRY)
+    graph.add_node("news", news_node, retry_policy=NETWORK_RETRY)
+    graph.add_node("peers", peers_node, retry_policy=NETWORK_RETRY)
+    graph.add_node("report", report_node, retry_policy=NETWORK_RETRY)
+
+    graph.add_edge(START, "market")
+    graph.add_edge("market", "news")      # fan out: news and peers run in parallel
+    graph.add_edge("market", "peers")
+    graph.add_edge(["news", "peers"], "report")  # fan in: report waits for both
+    graph.add_edge("report", END)
+    return graph.compile()
+
+
+agent_graph = build_agent_graph()
+
+
 # ── Run pipeline ──────────────────────────────────────────────────────────────
 def run_pipeline(ticker: str, on_step: Optional[Callable[[str, str, str], None]] = None) -> dict:
+    """Run the agent graph for one ticker. on_step(step, status, detail) receives progress updates."""
     ticker = ticker.upper().strip()
     print(f"\n{'='*50}")
     print(f"AlphaSignal Pipeline — {ticker}")
     print(f"{'='*50}")
 
-    initial_state: AgentState = {
-        "ticker": ticker,
-        "articles": [],
-        "stock_info": {},
-        "peers": {},
-        "brief": {},
-    }
-
-    # Progress updates for the UI: step id, status ("running" / "done"), detail text
-    step = on_step or (lambda *args: None)
-
-    # Consensus first: the scraper needs the company name to search the news
-    step("market", "running", "")
-    consensus_result = consensus_agent(initial_state)
-    stock_info = consensus_result["stock_info"]
-    if stock_info["price"] is None:
-        raise ValueError(f"No market data found for {ticker}")
-    step("market", "done", stock_info["name"])
-
-    # News and competitors don't depend on each other, so fetch them in parallel
-    def run_news():
-        step("news", "running", "")
-        result = scraper_agent({**initial_state, "stock_info": stock_info})
-        publishers = {a["source"] for a in result["articles"]}
-        step("news", "done", f"{len(result['articles'])} articles from {len(publishers)} publishers")
-        return result
-
-    def run_peers():
-        step("peers", "running", "")
-        result = peers_agent({**initial_state, "stock_info": stock_info})
-        step("peers", "done", ", ".join(p["ticker"] for p in result["peers"]["companies"]))
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        news_future, peers_future = executor.submit(run_news), executor.submit(run_peers)
-        scraper_result, peers_result = news_future.result(), peers_future.result()
-
-    print("[Orchestrator] Data collected — running report agent")
-
-    merged_state: AgentState = {
-        "ticker": ticker,
-        "articles": scraper_result["articles"],
-        "stock_info": stock_info,
-        "peers": peers_result["peers"],
-        "brief": {},
-    }
-
-    step("brief", "running", "")
-    report_result = report_agent(merged_state)
-    step("brief", "done", "")
+    state = agent_graph.invoke({"ticker": ticker}, config={"configurable": {"on_step": on_step}})
 
     return {
         "ticker": ticker,
-        "stock": stock_info,
-        "brief": report_result["brief"],
-        "peers": peers_result["peers"],
-        "articles": merged_state["articles"],
+        "stock": state["stock_info"],
+        "brief": state["brief"],
+        "peers": state["peers"],
+        "articles": state["articles"],
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
 
 if __name__ == "__main__":
     import json
-    result = run_pipeline("NVDA")
-    print("\n" + "="*50)
-    print(json.dumps(result["brief"], indent=2))
+    import sys
+    if "--graph" in sys.argv:
+        # Print the agent graph as a Mermaid diagram (paste into mermaid.live or a GitHub README)
+        print(agent_graph.get_graph().draw_mermaid())
+    else:
+        result = run_pipeline(sys.argv[1] if len(sys.argv) > 1 else "NVDA")
+        print("\n" + "="*50)
+        print(json.dumps(result["brief"], indent=2))

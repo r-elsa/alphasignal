@@ -1160,3 +1160,464 @@ body {
 .valuation-card .notice {
   margin: 0 0 10px;
 }
+
+/* ── Header navigation ── */
+.header-nav {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.header-nav button {
+  border: none;
+  background: none;
+  font-size: 14px;
+  font-weight: 600;
+  color: #6b7280;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.header-nav button:hover {
+  color: #111827;
+  background: #f3f4f6;
+}
+
+.header-nav button.active {
+  color: #111827;
+  background: #f3f4f6;
+}
+
+@media (max-width: 600px) {
+  .header-subtitle { display: none; }
+  .header { padding: 12px 16px; flex-wrap: wrap; }
+}
+
+/* ── Portfolio ── */
+.portfolio-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.portfolio-summary .card {
+  margin-bottom: 0;
+  padding: 18px 20px;
+}
+
+.summary-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: #111827;
+  margin-top: 2px;
+}
+
+.summary-value.green { color: #16a34a; }
+.summary-value.red   { color: #dc2626; }
+.stat-sub.green { color: #16a34a; }
+.stat-sub.red   { color: #dc2626; }
+
+.summary-card .info-tip {
+  right: auto;
+  left: -8px;
+}
+
+.holdings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  min-width: 560px;
+}
+
+.holdings-table th {
+  text-align: right;
+  font-size: 12px;
+  font-weight: 500;
+  color: #6b7280;
+  padding: 6px 8px;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+}
+
+.holdings-table td {
+  text-align: right;
+  padding: 10px 8px;
+  border-bottom: 1px solid #f3f4f6;
+  white-space: nowrap;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+}
+
+.holdings-table th:first-child,
+.holdings-table td:first-child {
+  text-align: left;
+}
+
+.holdings-table td.green { color: #16a34a; }
+.holdings-table td.red   { color: #dc2626; }
+
+.holdings-table .info-tip {
+  right: -8px;
+  left: auto;
+}
+
+.holding-ticker {
+  font-weight: 700;
+  color: #111827;
+}
+
+.holding-ticker:hover {
+  color: #2563eb;
+}
+
+.cell-sub {
+  display: block;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.cell-sub.green { color: #16a34a; }
+.cell-sub.red   { color: #dc2626; }
+
+.weight-bar {
+  display: block;
+  height: 4px;
+  width: 60px;
+  margin: 4px 0 0 auto;
+  background: #f3f4f6;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.weight-bar span {
+  display: block;
+  height: 100%;
+  background: #2563eb;
+}
+
+.cell-input {
+  width: 80px;
+  padding: 4px 6px;
+  font-size: 13px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  text-align: right;
+}
+
+.holdings-table td.row-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.holdings-table th,
+.holdings-table td {
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
+.link-button.danger {
+  color: #dc2626;
+}
+
+.empty-portfolio p {
+  font-size: 14px;
+  color: #374151;
+  line-height: 1.6;
+}
+
+.add-holding label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #6b7280;
+  flex: 1;
+  min-width: 140px;
+}
+
+.add-holding label:first-child {
+  flex: 2;
+  min-width: 200px;
+}
+
+.add-holding .info-tip {
+  right: auto;
+  left: -8px;
+}
+
+.add-fields {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.add-fields input {
+  padding: 10px 12px;
+  font-size: 15px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  outline: none;
+  color: #111827;
+}
+
+.add-fields input:focus {
+  border-color: #111827;
+}
+
+.add-fields button {
+  padding: 11px 22px;
+  background: #111827;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.add-fields button:disabled {
+  background: #9ca3af;
+}
+
+.add-holding .error {
+  margin: 12px 0 0;
+}
+
+.added-note {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #16a34a;
+}
+
+/* ── Portfolio switcher ── */
+.portfolio-bar {
+  margin-bottom: 16px;
+}
+
+.portfolio-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.portfolio-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #374151;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 99px;
+  cursor: pointer;
+}
+
+.portfolio-tabs button.active {
+  background: #111827;
+  border-color: #111827;
+  color: #ffffff;
+}
+
+.portfolio-tabs .tab-count {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 99px;
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.portfolio-tabs button.active .tab-count {
+  background: #374151;
+  color: #e5e7eb;
+}
+
+.portfolio-tabs .new-portfolio {
+  border-style: dashed;
+  color: #6b7280;
+}
+
+.name-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.name-form input {
+  flex: 1;
+  min-width: 200px;
+  padding: 9px 12px;
+  font-size: 15px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  outline: none;
+}
+
+.name-form input:focus {
+  border-color: #111827;
+}
+
+.name-form button[type="submit"] {
+  padding: 9px 18px;
+  background: #111827;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.portfolio-bar .error,
+.empty-portfolio .error {
+  margin: 10px 0 0;
+}
+
+.portfolio-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.portfolio-heading h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-right: 4px;
+}
+
+.portfolio-heading .link-button {
+  font-size: 13px;
+}
+
+.portfolio-heading .name-form {
+  margin-top: 0;
+  flex: 1;
+}
+
+/* ── Morning email ── */
+.morning-email .notice {
+  margin: 0 0 14px;
+}
+
+.morning-email code {
+  font-size: 12px;
+  background: #fef3c7;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.morning-email .info-tip {
+  right: auto;
+  left: -8px;
+}
+
+.email-fields {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.email-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.email-fields label:first-child {
+  flex: 1;
+  min-width: 220px;
+}
+
+.email-fields input[type="email"],
+.email-fields input[type="time"] {
+  padding: 10px 12px;
+  font-size: 15px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  outline: none;
+  color: #111827;
+}
+
+.email-fields input:focus {
+  border-color: #111827;
+}
+
+.email-fields label.toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: #374151;
+  padding-bottom: 11px;
+}
+
+.email-fields button {
+  padding: 11px 22px;
+  background: #111827;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.email-fields button:disabled {
+  background: #9ca3af;
+}
+
+.email-actions {
+  display: flex;
+  gap: 18px;
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+.link-button:disabled {
+  color: #9ca3af;
+  cursor: not-allowed;
+}
+
+.morning-email .error {
+  margin: 12px 0 0;
+}
+
+.email-preview {
+  margin-top: 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.email-preview-bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  font-size: 13px;
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.email-preview iframe {
+  display: block;
+  width: 100%;
+  height: 640px;
+  border: none;
+  background: #f9fafb;
+}
