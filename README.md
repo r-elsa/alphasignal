@@ -17,23 +17,32 @@ Enter a company or ticker and get everything that matters in one page: live pric
 
 ## How it works
 
-The analysis is a [LangGraph](https://langchain-ai.github.io/langgraph/) graph of four agents. LangGraph orchestrates in the backend; each agent runs in its own Docker container and receives work over a Redis queue (Celery):
+The analysis is a [LangGraph](https://langchain-ai.github.io/langgraph/) graph of six agents. LangGraph orchestrates in the backend; each agent runs in its own Docker container and receives work over a Redis queue (Celery):
 
 ```mermaid
 graph LR
     start([start]) --> market[Market agent<br/>price, analysts, financials]
-    market --> news[News agent<br/>news from many publishers]
+    market --> news[News agent<br/>finds and ranks articles]
     market --> peers[Peers agent<br/>competitors]
-    news --> report[Report agent<br/>cited AI brief]
+    news --> reader[Reader agent<br/>full text where allowed]
+    reader --> report[Report agent<br/>AI brief with quotes]
     peers --> report
-    report --> done([end])
+    report --> verifier[Verifier agent<br/>checks every quote]
+    verifier -- rejected claims --> report
+    verifier --> done([end])
 ```
 
 1. **Market agent** fetches price, analyst data, financials, earnings history and insider trades (yfinance). It runs first because the others need the company name.
-2. **News agent** and **Peers agent** run in parallel: news from Google News (also in the stock's home-market language), Yahoo Finance, Seeking Alpha and Nasdaq; competitors from Finnhub, reviewed by AI.
-3. **Report agent** waits for both, then writes a structured brief with an OpenAI model, citing articles by ID.
+2. **News agent** searches Google News, including preferred sources and the stock's home-market language, plus Yahoo Finance, Seeking Alpha and Nasdaq. Preferred sources rank first, and forums and filler are dropped. **Peers agent** runs in parallel and finds competitors from Finnhub, reviewed by AI.
+3. **Reader agent** gets article text where the site allows it. It identifies itself, respects `robots.txt` and doesn't try to get past paywalls; everything else stays "headline only" and is labelled. It also corrects dates when the page disagrees with the feed.
+4. **Report agent** writes a structured brief in which each claim from an article carries an exact quote. Articles are classified as news, opinion or personal; only news can support "What happened", and likely old stories are excluded. A move of 2% or more gets an explanation, or "no clear reason found".
+5. **Verifier agent** checks in code that each quote really appears in the article. Rejected claims go back to the Report agent (at most twice), and anything still failing is removed and listed on the page.
+
+The check confirms that the source says it, not that the source is right or that the quote fully supports the claim.
 
 Each agent can be scaled separately, e.g. `docker compose up -d --scale news-agent=4`. If a worker dies mid-job, the job times out and LangGraph retries it on another worker (up to 3 attempts with backoff). An unknown ticker fails immediately. Progress, including which worker ran each agent, is streamed to the React frontend with Server-Sent Events. To print the graph: `python pipeline.py --graph`.
+
+Tests for the source, date and quote rules: `cd backend && pip install -r requirements-dev.txt && python -m pytest tests`.
 
 The portfolio and morning-email settings are stored in PostgreSQL (run with Docker Compose) through SQLAlchemy, with Alembic migrations applied on startup.
 

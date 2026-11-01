@@ -2,7 +2,8 @@
 import socket
 
 from celery_app import celery_app
-from pipeline import consensus_agent, peers_agent, report_agent, scraper_agent
+from pipeline import consensus_agent, peers_agent, report_agent, scraper_agent, verifier_agent
+from reader import reader_agent
 
 
 def _run(agent, state: dict) -> dict:
@@ -27,3 +28,13 @@ def peers(state: dict) -> dict:
 @celery_app.task(name="agents.report")
 def report(state: dict) -> dict:
     return _run(report_agent, state)
+
+
+@celery_app.task(name="agents.reader")
+def reader(state: dict) -> dict:
+    return _run(reader_agent, state)
+
+
+@celery_app.task(name="agents.verifier")
+def verifier(state: dict) -> dict:
+    return _run(verifier_agent, state)

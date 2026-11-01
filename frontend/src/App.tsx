@@ -82,8 +82,24 @@ interface EarningsQuarter {
   surprise_pct: number;
 }
 
+interface Evidence {
+  article_id: number;
+  quote: string;
+  level: "article" | "headline";
+}
+
 interface Cited {
   source_ids: number[];
+  evidence?: Evidence[];
+}
+
+interface Checks {
+  from_article_text: number;
+  headline_only: number;
+  not_from_news: number;
+  corrected: number;
+  removed: { section: string; claim: string; reason: string }[];
+  rounds: number;
 }
 
 interface Development extends Cited {
@@ -97,6 +113,8 @@ interface Point extends Cited {
 
 interface Brief {
   company_description: string;
+  move?: ({ change_pct: number; text: string } & Cited) | null;
+  checks?: Checks;
   tldr: string;
   developments: Development[];
   bull_case: Point[];
@@ -112,6 +130,9 @@ interface Article {
   source: string;
   published: string | null;
   sentiment: "positive" | "negative" | "neutral";
+  kind?: "news" | "opinion";
+  date_suspect?: boolean;
+  read?: "full" | "headline";
   same_story_as?: number;
 }
 
@@ -642,8 +663,10 @@ function PeersCard({ result }: { result: Result }) {
 const STEPS = [
   { id: "market", label: "Fetching price and analyst data" },
   { id: "news", label: "Searching the news" },
+  { id: "reader", label: "Reading the articles" },
   { id: "peers", label: "Finding competitors" },
   { id: "brief", label: "Writing the brief" },
+  { id: "verifier", label: "Checking the claims" },
 ];
 
 type StepState = Record<string, { status: "running" | "done"; detail: string }>;
@@ -654,6 +677,8 @@ interface Suggestion {
   exchange: string;
   type: string;
 }
+
+const quoteFor = (id: number, evidence?: Evidence[]) => evidence?.find(e => e.article_id === id);
 
 type View = "analyse" | "portfolio";
 
@@ -791,7 +816,7 @@ export default function App() {
     return "stat-value amber";
   };
 
-  const Cites = ({ ids }: { ids: number[] }) => {
+  const Cites = ({ ids, evidence }: { ids: number[]; evidence?: Evidence[] }) => {
     if (!result) return null;
     if (ids.length === 0) return <span className="cite-background">not from news</span>;
     return (
@@ -799,7 +824,14 @@ export default function App() {
         {ids.map(id => {
           const a = result.articles.find(x => x.id === id);
           return a ? (
-            <a key={id} className="cite" href={a.link} target="_blank" rel="noreferrer" title={a.title}>
+            <a
+              key={id}
+              className={"cite" + (quoteFor(id, evidence)?.level === "headline" ? " cite-headline" : "")}
+              href={a.link}
+              target="_blank"
+              rel="noreferrer"
+              title={quoteFor(id, evidence) ? `“${quoteFor(id, evidence)!.quote}”\n${a.source}${quoteFor(id, evidence)!.level === "headline" ? " (headline only)" : ""}` : a.title}
+            >
               {id}
             </a>
           ) : null;
@@ -1091,6 +1123,14 @@ export default function App() {
 
             <div className="card brief-card">
               <div className="brief-label">⚡ AI Investment Brief</div>
+              {b.move && (
+                <div className={"move-reason " + (b.move.change_pct < 0 ? "down" : "up")}>
+                  <strong>
+                    {b.move.change_pct < 0 ? "Down" : "Up"} {Math.abs(b.move.change_pct).toFixed(1)}%:
+                  </strong>{" "}
+                  {b.move.text} {b.move.source_ids.length > 0 && <Cites ids={b.move.source_ids} evidence={b.move.evidence} />}
+                </div>
+              )}
               {b.tldr && (
                 <div className="tldr">
                   <span className="tldr-label">In short</span>
@@ -1105,7 +1145,7 @@ export default function App() {
                   {b.developments.map((d, i) => (
                     <li key={i}>
                       <div className="dev-headline">
-                        {d.headline} <Cites ids={d.source_ids} />
+                        {d.headline} <Cites ids={d.source_ids} evidence={d.evidence} />
                       </div>
                       <div className="dev-why">{d.why_it_matters}</div>
                     </li>
@@ -1118,7 +1158,7 @@ export default function App() {
                   <h3>Bull case</h3>
                   <ul>
                     {b.bull_case.map((p, i) => (
-                      <li key={i}>{p.text} <Cites ids={p.source_ids} /></li>
+                      <li key={i}>{p.text} <Cites ids={p.source_ids} evidence={p.evidence} /></li>
                     ))}
                   </ul>
                 </section>
@@ -1126,7 +1166,7 @@ export default function App() {
                   <h3>Bear case</h3>
                   <ul>
                     {b.bear_case.map((p, i) => (
-                      <li key={i}>{p.text} <Cites ids={p.source_ids} /></li>
+                      <li key={i}>{p.text} <Cites ids={p.source_ids} evidence={p.evidence} /></li>
                     ))}
                   </ul>
                 </section>
@@ -1150,6 +1190,35 @@ export default function App() {
                 </div>
                 <p>{b.sentiment.summary}</p>
               </section>
+
+              {b.checks && (
+                <section className="brief-section checks">
+                  <h3>How these claims were checked</h3>
+                  <p>
+                    A checker compares each quote with the article: <strong>{b.checks.from_article_text}</strong> quoted from
+                    the article text, <strong>{b.checks.headline_only}</strong> from the headline only,{" "}
+                    <strong>{b.checks.not_from_news}</strong> not from news
+                    {b.checks.corrected > 0 && <>, <strong>{b.checks.corrected}</strong> corrected</>}
+                    {b.checks.removed.length > 0 && <>, <strong>{b.checks.removed.length}</strong> removed</>}.
+                  </p>
+                  {b.checks.removed.length > 0 && (
+                    <details>
+                      <summary>Show removed claims</summary>
+                      <ul>
+                        {b.checks.removed.map((r, i) => (
+                          <li key={i}>
+                            <strong>{r.section}:</strong> {r.claim}
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                  <p className="peer-source">
+                    Hover over a blue number to see the quote; orange numbers rest on a headline only. This shows the source
+                    says it, not that the source is right or that the quote fully supports the claim.
+                  </p>
+                </section>
+              )}
             </div>
 
             <div className="card health-card">
@@ -1278,6 +1347,9 @@ export default function App() {
                         <span className="source-meta">
                           {a.source}
                           {a.published && " · " + shortDate(a.published)}
+                          {a.kind === "opinion" && " · opinion"}
+                          {a.read === "headline" && " · headline only"}
+                          {a.date_suspect && " · date uncertain"}
                         </span>
                         {alsoCovered.length > 0 && (
                           <div className="also-covered">

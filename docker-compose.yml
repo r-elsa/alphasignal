@@ -51,6 +51,14 @@ services:
       replicas: 2  # survives losing a worker
     command: celery -A tasks worker -Q news -n news@%h --pool=threads --concurrency=4 --loglevel=INFO
 
+  reader-agent:
+    <<: *agent
+    command: celery -A tasks worker -Q reader -n reader@%h --pool=threads --concurrency=4 --loglevel=INFO
+
+  verifier-agent:
+    <<: *agent
+    command: celery -A tasks worker -Q verifier -n verifier@%h --pool=threads --concurrency=4 --loglevel=INFO
+
   peers-agent:
     <<: *agent
     command: celery -A tasks worker -Q peers -n peers@%h --pool=threads --concurrency=4 --loglevel=INFO

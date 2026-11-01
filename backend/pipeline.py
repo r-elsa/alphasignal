@@ -16,6 +16,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 from agents_client import ensure_agents_running, run_agent
+from news_quality import PREFERRED_SITES, date_looks_wrong, is_blocked, rank_sources
+from verification import NO_REASON, scorecard, verify_brief
 from pydantic import BaseModel, Field
 from typing import Callable, List, Literal, Optional, TypedDict
 import concurrent.futures
@@ -33,24 +35,31 @@ class AgentState(TypedDict, total=False):
     stock_info: dict   # market agent
     articles: list     # news agent (the report agent adds sentiment and story groups)
     peers: dict        # peers agent
-    brief: dict        # report agent
+    brief: dict        # report agent, then checked by the verifier agent
+    verification: dict # verifier agent: rounds so far, rejected claims, scorecard
 
 
 # ── Brief schema (the LLM must return exactly this) ──────────────────────────
+class Evidence(BaseModel):
+    article_id: int
+    quote: str = Field(description="An exact copy of 5-25 consecutive words from that article's Text or headline, in its original language.")
+
+
 class Development(BaseModel):
     headline: str = Field(description="What happened, in one short sentence. A concrete event, not an opinion piece.")
     why_it_matters: str = Field(description="One sentence on the impact for this company specifically.")
-    source_ids: List[int] = Field(description="IDs of the 1-3 best articles this comes from, strongest first. Must not be empty.")
+    evidence: List[Evidence] = Field(description="1-3 quotes from the best articles, strongest first. Must not be empty.")
 
 
 class Point(BaseModel):
     text: str = Field(description="One specific sentence about this company.")
-    source_ids: List[int] = Field(description="Supporting article IDs. Empty only if this is general background knowledge.")
+    evidence: List[Evidence] = Field(description="Quotes supporting it. Empty only if the point comes from the financial data or general background knowledge.")
 
 
 class ArticleSentiment(BaseModel):
     id: int
     sentiment: Literal["positive", "negative", "neutral"] = Field(description="Tone of the article towards this stock.")
+    kind: Literal["news", "opinion", "personal"] = Field(description="news: reports events or facts. opinion: analysis, stock picks, 'should you buy', predictions. personal: an individual's own post or trade.")
 
 
 class Brief(BaseModel):
@@ -58,6 +67,8 @@ class Brief(BaseModel):
     article_sentiment: List[ArticleSentiment] = Field(description="One entry per article provided.")
     story_groups: List[List[int]] = Field(description="Groups of article IDs that report the same specific news item: the same announcement, the same analyst note, the same comments by the same person. Articles that only share a theme (e.g. two different iPhone stories) are NOT the same story. Only groups of 2 or more; each ID in at most one group. When in doubt, don't group.")
     company_description: str = Field(description="One plain sentence a beginner understands: what the company does and how it makes money. No jargon.")
+    move_explanation: str = Field(description="Why the stock moved in its latest session, in one sentence, using only recent articles. Exactly 'No clear reason found in the news.' if none explains it.")
+    move_evidence: List[Evidence] = Field(description="Quotes from the articles that explain the move. Empty if no clear reason was found.")
     tldr: str = Field(description="One or two plain sentences summing up the current situation for a beginner investor.")
     developments: List[Development] = Field(description="Up to 5 most important recent events, most impactful first. Fewer (even zero) is fine when there is little real news.")
     bull_case: List[Point] = Field(description="2-3 specific reasons the stock could go up.")
@@ -168,7 +179,11 @@ FILLER = re.compile(
     ]),
     re.I,
 )
-PUBLISHER_NAMES = {"fool": "The Motley Fool", "thestreet": "TheStreet", "investing": "Investing.com", "barchart": "Barchart", "cnbc": "CNBC"}
+PUBLISHER_NAMES = {
+    "fool": "The Motley Fool", "thestreet": "TheStreet", "investing": "Investing.com", "barchart": "Barchart", "cnbc": "CNBC",
+    "bloomberg": "Bloomberg", "reuters": "Reuters", "dagens industri": "Dagens Industri", "new york times": "The New York Times",
+    "marketscreener": "MarketScreener",
+}
 
 
 def _publisher(source: str) -> str:
@@ -176,6 +191,10 @@ def _publisher(source: str) -> str:
     s = source.lower()
     if "yahoo" in s:
         return "Yahoo Finance"
+    if s in ("di", "di.se"):
+        return "Dagens Industri"
+    if s in ("ft", "ft.com"):
+        return "Financial Times"
     for key, name in PUBLISHER_NAMES.items():
         if key in s:
             return name
@@ -190,6 +209,9 @@ def _title_words(title: str, ticker: str) -> set:
 
 def _short_name(name: str) -> str:
     """'NVIDIA Corporation' -> 'NVIDIA', 'Apple Inc.' -> 'Apple', 'Stora Enso Oyj' -> 'Stora Enso'."""
+    # Swedish forms: "AB Volvo (publ)" -> "Volvo"
+    name = re.sub(r"\s*\(publ\)", "", name, flags=re.I)
+    name = re.sub(r"^AB\s+", "", name)
     short = re.sub(r"\b(corporation|corp|incorporated|inc|ltd|limited|plc|holdings?|group|company|co|n\.v|s\.a|ag|se)\b\.?", "", name, flags=re.I)
     # European legal forms, only at the end so names like "AB InBev" survive
     short = re.sub(r"[,\s]+(oyj|abp|ab|asa|a/s|sa/nv|aktiengesellschaft|kgaa|s\.?p\.?a\.?|b\.?v\.?)\.?$", "", short.strip(), flags=re.I)
@@ -263,7 +285,14 @@ def scraper_agent(state: AgentState) -> AgentState:
 
     def google_feeds(window):
         # Google News aggregates many publishers (Reuters, CNBC, WSJ, Bloomberg, FT, Barron's...)
-        urls = [(_google_news_url(f"{english_query} when:{window}"), "Google News")]
+        sites = " OR ".join(f"site:{site}" for site in PREFERRED_SITES if site not in ("e24.no", "di.se"))
+        urls = [
+            (_google_news_url(f"{english_query} when:{window}"), "Google News"),
+            (_google_news_url(f"({name_query}) ({sites}) when:{window}"), "Google News"),
+            # These two only return results in their own language
+            (_google_news_url(f"({name_query}) site:e24.no when:{window}", "no", "NO"), "Google News"),
+            (_google_news_url(f"({name_query}) site:di.se when:{window}", "sv", "SE"), "Google News"),
+        ]
         if home and home != ("en-US", "US"):
             # Local press writes about home companies by name, without "stock"
             urls.append((_google_news_url(f"{name_query} when:{window}", *home), "Google News"))
@@ -323,6 +352,7 @@ def scraper_agent(state: AgentState) -> AgentState:
             if (name_pattern.search(a["title"] + " " + a["summary"]) or ticker_re.search(a["title"] + " " + a["summary"]))
             and not QUOTE_PAGE.search(a["title"])
             and not FILLER.search(a["title"])
+            and not is_blocked(a["source"])
         ]
 
     articles = relevant(fetch_all(feeds))
@@ -331,8 +361,9 @@ def scraper_agent(state: AgentState) -> AgentState:
         print(f"[Scraper Agent] Only {len(articles)} articles in 7 days, widening to 30 days")
         articles += relevant(fetch_all(google_feeds("30d")))
 
-    # Deduplicate by title, newest first, and cap each publisher so no single one dominates
-    articles.sort(key=lambda a: a["published"] or "", reverse=True)
+    # Deduplicate by title and cap each publisher so no single one dominates.
+    # Preferred sources fill the slots first.
+    articles = rank_sources(articles)
     seen = []
     per_publisher = {}
     unique_articles = []
@@ -349,6 +380,7 @@ def scraper_agent(state: AgentState) -> AgentState:
         if len(unique_articles) >= MAX_ARTICLES:
             break
 
+    unique_articles.sort(key=lambda a: a["published"] or "", reverse=True)
     for i, a in enumerate(unique_articles, start=1):
         a["id"] = i
 
@@ -381,9 +413,19 @@ def consensus_agent(state: AgentState) -> AgentState:
     try:
         dates = (stock.calendar or {}).get("Earnings Date") or []
         if dates:
-            next_earnings = dates[0].isoformat()
+            upcoming = [d for d in dates if d >= datetime.date.today()]
+            next_earnings = upcoming[0].isoformat() if upcoming else None
     except Exception as e:
         print(f"[Consensus Agent] No earnings date: {e}")
+
+    # When results actually came out, to spot old earnings stories with a recent date
+    earnings_dates = []
+    try:
+        ed = stock.get_earnings_dates(limit=32)
+        if ed is not None and not ed.empty:
+            earnings_dates = [idx.date().isoformat() for idx in ed["Reported EPS"].dropna().index]
+    except Exception as e:
+        print(f"[Consensus Agent] No earnings dates: {e}")
 
     earnings_history = []
     try:
@@ -532,6 +574,7 @@ def consensus_agent(state: AgentState) -> AgentState:
         "analyst_count": info.get("numberOfAnalystOpinions"),
         "ratings": ratings,
         "next_earnings": next_earnings,
+        "earnings_dates": earnings_dates,
         "business_summary": (info.get("longBusinessSummary") or "")[:1200],
         "financials": financials,
         "earnings_history": earnings_history,
@@ -679,16 +722,41 @@ def _peer_summary(s: dict, m: dict) -> List[str]:
 
 
 # ── Agent 4: Report ───────────────────────────────────────────────────────────
+BIG_MOVE_PCT = 2.0  # a move this large gets an explanation at the top of the brief
+
+
 def report_agent(state: AgentState) -> AgentState:
     print(f"[Report Agent] Generating brief...")
     s = state["stock_info"]
     articles = state["articles"]
 
-    article_list = "\n".join([
-        f"[{a['id']}] ({a['published'][:10] if a['published'] else 'undated'}, {a['source']}) {a['title']}"
-        + (f" — {a['summary'][:200]}" if a.get("summary") else "")
-        for a in articles
-    ]) or "(no articles found)"
+    for a in articles:
+        a.pop("same_story_as", None)  # the report can run again after the verifier sends it back
+        a["date_suspect"] = bool(a.get("date_old")) or date_looks_wrong(a["title"], a["published"], s.get("earnings_dates"))
+
+    def describe(a):
+        line = f"[{a['id']}] ({a['published'][:10] if a['published'] else 'undated'}, {a['source']})"
+        if a["date_suspect"]:
+            line += " [DATE SUSPECT: likely an old story]"
+        line += f" {a['title']}"
+        if a.get("summary"):
+            line += f" — {a['summary'][:200]}"
+        return line + (f"\n    Text: {a['text']}" if a.get("text") else "\n    (headline only: the full text isn't available)")
+
+    article_list = "\n".join(describe(a) for a in articles) or "(no articles found)"
+
+    # Claims the verifier rejected last time, for the agent to fix
+    rejected = (state.get("verification") or {}).get("rejected") or []
+    feedback = ""
+    if rejected:
+        problems = "\n".join(f"- {r['section']}: \"{r['claim']}\": {r['reason']}" for r in rejected)
+        feedback = f"""
+
+A CHECKER REJECTED THESE CLAIMS FROM YOUR PREVIOUS DRAFT, because their quotes aren't in the articles:
+{problems}
+For each one, either quote the article's exact words or leave the claim out. Never reword a quote."""
+    session = s["as_of"][:10] if s.get("as_of") else "unknown"
+    reported = ", ".join((s.get("earnings_dates") or [])[:2]) or "unknown"
 
     prompt = f"""You are a senior equity analyst writing a short, specific brief on {s['name']} ({state['ticker']}).
 Today is {datetime.date.today().isoformat()}.
@@ -697,7 +765,8 @@ The reader can ALREADY SEE these numbers on screen. Use them for reasoning, but 
 - Price ${s['price']} ({s['change_pct']}% today), 52-week range ${s['week52_low']}–${s['week52_high']}
 - Trailing P/E {s['trailing_pe']}, forward P/E {s['forward_pe']}
 - Analyst consensus {s['recommendation']} from {s['analyst_count']} analysts, mean target ${s['target_mean']} (range ${s['target_low']}–${s['target_high']})
-- Next earnings date: {s['next_earnings'] or 'unknown'}
+- Next earnings date: {s['next_earnings'] or 'unknown'}. Latest results came out on: {reported}
+- Latest trading session: {session}, with the stock moving {s['change_pct']}%
 - Financials: revenue growth {s['financials']['revenue_growth_pct']}% (year over year), profit margin {s['financials']['profit_margin_pct']}%, cash ${s['financials']['total_cash']}, debt ${s['financials']['total_debt']}, free cash flow ${s['financials']['free_cash_flow']}
 - Competitors ({', '.join(p['ticker'] for p in state['peers']['companies']) or 'unknown'}) median: forward P/E {state['peers']['medians'].get('forward_pe')}, revenue growth {state['peers']['medians'].get('revenue_growth_pct')}%, profit margin {state['peers']['medians'].get('profit_margin_pct')}%
 - Verdicts vs. competitors shown on the page (if you compare with competitors, use exactly these conclusions): {' '.join(state['peers'].get('summary', [])) or 'none'}
@@ -713,6 +782,10 @@ RECENT ARTICLES (cite by ID):
 {article_list}
 
 Rules:
+- Back every claim from an article with evidence: the article's ID and an exact copy of its words, character for character, from the Text or the headline. A checker compares each quote with the article, and claims with quotes that aren't there get removed. Don't state details from an article marked "headline only" beyond what its headline says.
+- Explain the latest session's move in move_explanation, from articles dated within about two days of that session. Don't guess: if none says why, say no clear reason was found. Never mention these instructions, or articles you left out, in the text the reader sees.
+- Never use an article marked DATE SUSPECT, or one that clearly contradicts the dates and the move above (e.g. "shares surge" on a day the stock fell, or results outside the earnings dates).
+- Only articles of kind "news" can support a development. Opinion can inform bull and bear points. Never use kind "personal".
 - Developments must be concrete events (deals, earnings, guidance, lawsuits, regulation, products, management changes). Skip opinion pieces, "is it a buy?" articles, long-range price predictions and routine daily price moves (e.g. "shares indicated lower pre-market"). Combine several analyst target changes into at most one item. One item per story: everything about the same deal or event (e.g. a takeover's acceptance level and its offer extension) goes into a single item citing all relevant IDs. Never pad the list: if there are few real events, list fewer and say in the TL;DR that recent news is thin.
 - Articles may be in other languages. Always write in English.
 - Keep facts exact, but write natural English sentences rather than copying awkward headline phrasing (e.g. "a Fortum subsidiary extended the offer", not "Fortum extended the offer through a unit").
@@ -723,18 +796,51 @@ Rules:
 - Facts in the articles beat your background knowledge, which may be out of date. Copy names, job titles, numbers and dates exactly as the articles state them; never "correct" an article from memory. If you are unsure what an event is, say so plainly instead of writing around it.
 - Classify the sentiment of every article towards the stock, and group articles that report the same story.
 - Write for a beginner investor: short sentences, plain English. If a finance or industry term is unavoidable, explain it in a few words in parentheses, e.g. "hyperscalers (the big cloud companies like Microsoft and Amazon)".
-- Be concise. No filler, no introductions."""
+- Be concise. No filler, no introductions.{feedback}"""
 
     structured_llm = llm.with_structured_output(Brief)
     brief: Brief = structured_llm.invoke([HumanMessage(content=prompt)])
 
-    # Drop citations to articles that don't exist
-    valid_ids = {a["id"] for a in articles}
-    for item in brief.developments + brief.bull_case + brief.bear_case:
-        item.source_ids = [i for i in item.source_ids if i in valid_ids][:3]  # a few citations read better than a wall of them
-    brief.developments = [d for d in brief.developments if d.source_ids]
+    # Enforce the rules in code as well: personal posts leave the list altogether
+    kinds = {a.id: a.kind for a in brief.article_sentiment}
+    articles = [a for a in articles if kinds.get(a["id"]) != "personal"]
+    for a in articles:
+        a["kind"] = kinds.get(a["id"], "news")
+    usable = {a["id"] for a in articles if not a["date_suspect"]}
+    news_only = {a["id"] for a in articles if not a["date_suspect"] and a["kind"] == "news"}
+
+    def keep(evidence, allowed):
+        return [e.model_dump() for e in evidence if e.article_id in allowed][:3]  # a few read better than a wall of them
+
+    developments = []
+    for d in brief.developments:
+        evidence = keep(d.evidence, news_only)
+        if evidence:
+            developments.append({**d.model_dump(), "evidence": evidence})
+    # A point that loses all its sources is dropped, not relabelled as "not from news"
+    def points(items):
+        kept = []
+        for p in items:
+            evidence = keep(p.evidence, usable)
+            if evidence or not p.evidence:
+                kept.append({**p.model_dump(), "evidence": evidence})
+        return kept
+
+    # The day's move: only sources from around that session can explain it
+    move = None
+    if isinstance(s.get("change_pct"), (int, float)) and abs(s["change_pct"]) >= BIG_MOVE_PCT:
+        earliest = (datetime.date.fromisoformat(session) - datetime.timedelta(days=2)).isoformat() if session != "unknown" else ""
+        recent = {a["id"] for a in articles if a["id"] in news_only and (a["published"] or "") >= earliest}
+        evidence = keep(brief.move_evidence, recent)
+        move = {
+            "change_pct": s["change_pct"],
+            "text": brief.move_explanation if evidence else NO_REASON,
+            "evidence": evidence,
+            "source_ids": [],
+        }
 
     # Count sentiment ourselves rather than trusting the model's arithmetic
+    valid_ids = {a["id"] for a in articles}
     labels = {a.id: a.sentiment for a in brief.article_sentiment if a.id in valid_ids}
     for a in articles:
         a["sentiment"] = labels.get(a["id"], "neutral")
@@ -754,10 +860,11 @@ Rules:
     print(f"[Report Agent] Brief generated")
     return {"articles": articles, "brief": {
         "company_description": brief.company_description,
+        "move": move,
         "tldr": brief.tldr,
-        "developments": [d.model_dump() for d in brief.developments],
-        "bull_case": [p.model_dump() for p in brief.bull_case],
-        "bear_case": [p.model_dump() for p in brief.bear_case],
+        "developments": developments,
+        "bull_case": points(brief.bull_case),
+        "bear_case": points(brief.bear_case),
         "watch": brief.watch,
         "sentiment": {**counts, "summary": brief.sentiment_summary},
     }}
@@ -765,15 +872,16 @@ Rules:
 
 # ── Agent graph (LangGraph) ───────────────────────────────────────────────────
 #
-#            ┌─> news ──┐
-#   market ──┤          ├──> report
-#            └─> peers ─┘
+#            ┌─> news ─> reader ─┐
+#   market ──┤                   ├──> report ──> verifier ──> done
+#            └─> peers ──────────┘       ^           │
+#                                        └─ rejected claims go back (max 2 times)
 #
 # LangGraph orchestrates; each agent runs in its own worker container, reached over a
 # Redis queue (see agents_client.py and tasks.py). The market agent runs first because
-# the others need the company name. News and peers don't depend on each other, so they
-# run in parallel; the report agent waits for both. Each node retries on network and API
-# errors, and on timeouts, so a job lost with a dead worker goes to another worker.
+# the others need the company name. The news and peers branches don't depend on each
+# other, so they run in parallel; the report agent waits for both. Each node retries on
+# network and API errors, and on timeouts, so a job lost with a dead worker goes to another worker.
 
 def _progress(config: RunnableConfig, step: str, status: str, detail: str = "") -> None:
     """Report progress to the UI ("running" / "done"), if the caller asked for it."""
@@ -812,12 +920,54 @@ def peers_node(state: AgentState, config: RunnableConfig) -> AgentState:
     return result
 
 
+def reader_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "reader", "running")
+    result, worker = run_agent("reader", state)
+    full = sum(a["read"] == "full" for a in result["articles"])
+    _progress(config, "reader", "done", f"full text of {full} of {len(result['articles'])} articles · {_on(worker)}")
+    return result
+
+
 def report_node(state: AgentState, config: RunnableConfig) -> AgentState:
-    _progress(config, "brief", "running")
+    rejected = (state.get("verification") or {}).get("rejected") or []
+    _progress(config, "brief", "running", f"fixing {len(rejected)} rejected claims" if rejected else "")
     result, worker = run_agent("report", state)
     _progress(config, "brief", "done", _on(worker))
     return result
 
+
+def verifier_agent(state: AgentState) -> AgentState:
+    """Check the brief's quotes against the articles (see verification.py). Runs in its own worker."""
+    previous = state.get("verification") or {}
+    rounds = previous.get("rounds", 0) + 1
+    final = rounds > MAX_FIX_ROUNDS
+    brief, rejected, removed = verify_brief(state["brief"], state["articles"], final=final)
+    first = previous.get("rejected_at_first", len(rejected))
+    verification = {"rounds": rounds, "rejected": rejected, "rejected_at_first": first}
+    if final or not rejected:
+        verification["rejected"] = []
+        verification["scorecard"] = scorecard(brief, first, removed, rounds)
+    return {"brief": brief, "verification": verification}
+
+
+def verifier_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    _progress(config, "verifier", "running")
+    result, worker = run_agent("verifier", state)
+    v = result["verification"]
+    if v["rejected"]:
+        detail = f"rejected {len(v['rejected'])} claims, sending them back · {_on(worker)}"
+    else:
+        c = v["scorecard"]
+        detail = f"{c['from_article_text']} from article text, {c['headline_only']} headline only, {len(c['removed'])} removed · {_on(worker)}"
+    _progress(config, "verifier", "done", detail)
+    return result
+
+
+def after_verifier(state: AgentState) -> str:
+    return "report" if state["verification"]["rejected"] else END
+
+
+MAX_FIX_ROUNDS = 2  # how many times rejected claims go back to the report agent
 
 # Network hiccups (Yahoo, news feeds, OpenAI) are retried with backoff: 1s, then 2s
 NETWORK_RETRY = RetryPolicy(max_attempts=3, initial_interval=1.0, backoff_factor=2.0)
@@ -828,13 +978,17 @@ def build_agent_graph():
     graph.add_node("market", market_node, retry_policy=NETWORK_RETRY)
     graph.add_node("news", news_node, retry_policy=NETWORK_RETRY)
     graph.add_node("peers", peers_node, retry_policy=NETWORK_RETRY)
+    graph.add_node("reader", reader_node, retry_policy=NETWORK_RETRY)
     graph.add_node("report", report_node, retry_policy=NETWORK_RETRY)
+    graph.add_node("verifier", verifier_node, retry_policy=NETWORK_RETRY)
 
     graph.add_edge(START, "market")
-    graph.add_edge("market", "news")      # fan out: news and peers run in parallel
+    graph.add_edge("market", "news")      # fan out: the news and peers branches run in parallel
     graph.add_edge("market", "peers")
-    graph.add_edge(["news", "peers"], "report")  # fan in: report waits for both
-    graph.add_edge("report", END)
+    graph.add_edge("news", "reader")
+    graph.add_edge(["reader", "peers"], "report")  # fan in: report waits for both
+    graph.add_edge("report", "verifier")
+    graph.add_conditional_edges("verifier", after_verifier, {"report": "report", END: END})  # the loop
     return graph.compile()
 
 
@@ -852,12 +1006,14 @@ def run_pipeline(ticker: str, on_step: Optional[Callable[[str, str, str], None]]
     ensure_agents_running()
     state = agent_graph.invoke({"ticker": ticker}, config={"configurable": {"on_step": on_step}})
 
+    # The article text was only for the agents; the page shows a headline and a link
+    articles = [{k: v for k, v in a.items() if k != "text"} for a in state["articles"]]
     return {
         "ticker": ticker,
         "stock": state["stock_info"],
-        "brief": state["brief"],
+        "brief": {**state["brief"], "checks": state["verification"]["scorecard"]},
         "peers": state["peers"],
-        "articles": state["articles"],
+        "articles": articles,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 

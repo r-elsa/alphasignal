@@ -13,3 +13,7 @@ psycopg[binary]==3.2.13
 alembic==1.16.5
 celery==5.5.3
 redis==5.2.1
+googlenewsdecoder==0.1.7
+selectolax==0.4.13
+trafilatura==2.0.0
+lxml_html_clean==0.4.6

@@ -7,10 +7,10 @@ from redis.exceptions import RedisError
 
 from celery_app import celery_app
 
-ALL_AGENTS = ("market", "news", "peers", "report")
+ALL_AGENTS = ("market", "news", "reader", "peers", "report", "verifier")
 # How long to wait for each agent. A job on a dead worker times out, and the
 # LangGraph retry sends a new one, which another worker picks up.
-TIMEOUTS = {"market": 40, "news": 40, "peers": 60, "report": 90}
+TIMEOUTS = {"market": 40, "news": 40, "reader": 90, "peers": 60, "report": 120, "verifier": 20}
 START_COMMAND = "docker compose up -d"
 
 
