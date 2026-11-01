@@ -1,4 +1,16 @@
-# Local PostgreSQL for AlphaSignal. Start it with: docker compose up -d
+# Local infrastructure for AlphaSignal. Start it with: docker compose up -d --build
+# Run more of one agent with, for example: docker compose up -d --scale news-agent=3
+x-agent: &agent
+  build: ./backend
+  image: alphasignal-agent
+  restart: unless-stopped
+  env_file: backend/.env
+  environment:
+    REDIS_URL: redis://redis:6379/0
+  depends_on:
+    redis:
+      condition: service_healthy
+
 services:
   db:
     image: postgres:16
@@ -16,6 +28,38 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"  # only reachable from this computer
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One worker per agent, each listening on its own queue
+  market-agent:
+    <<: *agent
+    command: celery -A tasks worker -Q market -n market@%h --pool=threads --concurrency=4 --loglevel=INFO
+
+  news-agent:
+    <<: *agent
+    deploy:
+      replicas: 2  # survives losing a worker
+    command: celery -A tasks worker -Q news -n news@%h --pool=threads --concurrency=4 --loglevel=INFO
+
+  peers-agent:
+    <<: *agent
+    command: celery -A tasks worker -Q peers -n peers@%h --pool=threads --concurrency=4 --loglevel=INFO
+
+  report-agent:
+    <<: *agent
+    deploy:
+      replicas: 2  # survives losing a worker
+    command: celery -A tasks worker -Q report -n report@%h --pool=threads --concurrency=4 --loglevel=INFO
 
 volumes:
   pgdata:

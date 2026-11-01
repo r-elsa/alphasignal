@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError, OperationalError
+from agents_client import AgentsUnavailable
 import db
 import digest
 import portfolio as pf
@@ -29,6 +30,11 @@ except OperationalError:
 @app.on_event("startup")
 def start_background_jobs():
     digest.start_scheduler()
+
+
+@app.exception_handler(AgentsUnavailable)
+def agents_unavailable(request: Request, exc: AgentsUnavailable):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(OperationalError)
@@ -85,6 +91,8 @@ def analyze_stream(ticker: str, refresh: bool = False):
             events.put(("result", result))
         except ValueError as e:
             events.put(("failed", {"message": str(e), "not_found": True}))
+        except AgentsUnavailable as e:
+            events.put(("failed", {"message": str(e), "not_found": False}))
         except Exception as e:
             print(f"[Stream] Pipeline failed for {key}: {e}")
             events.put(("failed", {"message": "Something went wrong. Try again in a moment.", "not_found": False}))

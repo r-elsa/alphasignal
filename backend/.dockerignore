@@ -1,0 +1,5 @@
+# Keys reach the workers at runtime through env_file, never inside the image
+.env
+venv/
+__pycache__/
+*.bak

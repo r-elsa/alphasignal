@@ -17,7 +17,7 @@ Enter a company or ticker and get everything that matters in one page: live pric
 
 ## How it works
 
-The analysis is a [LangGraph](https://langchain-ai.github.io/langgraph/) graph of four agents that share one state:
+The analysis is a [LangGraph](https://langchain-ai.github.io/langgraph/) graph of four agents. LangGraph orchestrates in the backend; each agent runs in its own Docker container and receives work over a Redis queue (Celery):
 
 ```mermaid
 graph LR
@@ -33,16 +33,16 @@ graph LR
 2. **News agent** and **Peers agent** run in parallel: news from Google News (also in the stock's home-market language), Yahoo Finance, Seeking Alpha and Nasdaq; competitors from Finnhub, reviewed by AI.
 3. **Report agent** waits for both, then writes a structured brief with an OpenAI model, citing articles by ID.
 
-Each agent retries on network and API errors (up to 3 attempts with backoff); an unknown ticker fails immediately. Progress is streamed to the React frontend with Server-Sent Events. To print the graph: `python pipeline.py --graph`.
+Each agent can be scaled separately, e.g. `docker compose up -d --scale news-agent=4`. If a worker dies mid-job, the job times out and LangGraph retries it on another worker (up to 3 attempts with backoff). An unknown ticker fails immediately. Progress, including which worker ran each agent, is streamed to the React frontend with Server-Sent Events. To print the graph: `python pipeline.py --graph`.
 
 The portfolio and morning-email settings are stored in PostgreSQL (run with Docker Compose) through SQLAlchemy, with Alembic migrations applied on startup.
 
 ## Running locally
 
-**Database** (Docker, e.g. Rancher Desktop or Docker Desktop)
+**Database, queue and agents** (Docker, e.g. Rancher Desktop or Docker Desktop). First create `backend/.env` from `backend/.env.example` and add your API keys.
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 **Backend** (Python 3.9+)

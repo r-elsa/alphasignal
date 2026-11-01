@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 import db
 import portfolio as pf
-from pipeline import llm, scraper_agent
+from agents_client import ensure_agents_running, run_agent
+from pipeline import llm
 
 RESEND_URL = "https://api.resend.com/emails"
 # Without a verified domain, Resend only delivers from this sender to your own signup address
@@ -43,12 +44,14 @@ def _default_since() -> datetime.datetime:
 
 
 
-def _news_since(holding: dict, since: datetime.datetime) -> List[dict]:
+def _news_since(holding: dict, since: datetime.datetime) -> Optional[List[dict]]:
+    """New articles for one holding, fetched by a news worker. None if that failed."""
     try:
-        articles = scraper_agent({"ticker": holding["ticker"], "stock_info": {"name": holding["name"]}})["articles"]
+        output, _ = run_agent("news", {"ticker": holding["ticker"], "stock_info": {"name": holding["name"]}})
+        articles = output["articles"]
     except Exception as e:
         print(f"[Digest] News failed for {holding['ticker']}: {e}")
-        return []
+        return None
     fresh = [a for a in articles if a.get("published") and datetime.datetime.fromisoformat(a["published"]) >= since]
     return fresh[:HEADLINES_PER_STOCK]  # already newest first
 
@@ -89,10 +92,15 @@ def build_digest(portfolio_id: int, since: Optional[datetime.datetime] = None) -
     since = since or _default_since()
 
     holdings = sorted(data["holdings"], key=lambda h: h["weight_pct"] or 0, reverse=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    ensure_agents_running(["news"])
+    # One queue job per holding; however many news workers are running share them
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         news = list(executor.map(lambda h: _news_since(h, since), holdings))
+    if holdings and all(n is None for n in news):
+        # Don't email "no new headlines" when the truth is that the fetch failed
+        raise RuntimeError("Couldn't fetch news for any holding.")
     for h, n in zip(holdings, news):
-        h["news"] = n
+        h["news"] = n or []
     summary = _summarise(data["name"], holdings)
 
     t = data["totals"]

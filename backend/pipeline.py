@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
+from agents_client import ensure_agents_running, run_agent
 from pydantic import BaseModel, Field
 from typing import Callable, List, Literal, Optional, TypedDict
 import concurrent.futures
@@ -768,9 +769,11 @@ Rules:
 #   market ──┤          ├──> report
 #            └─> peers ─┘
 #
-# The market agent runs first because the others need the company name. News and
-# peers don't depend on each other, so LangGraph runs them in parallel; the report
-# agent waits for both. Each node retries on network and API errors.
+# LangGraph orchestrates; each agent runs in its own worker container, reached over a
+# Redis queue (see agents_client.py and tasks.py). The market agent runs first because
+# the others need the company name. News and peers don't depend on each other, so they
+# run in parallel; the report agent waits for both. Each node retries on network and API
+# errors, and on timeouts, so a job lost with a dead worker goes to another worker.
 
 def _progress(config: RunnableConfig, step: str, status: str, detail: str = "") -> None:
     """Report progress to the UI ("running" / "done"), if the caller asked for it."""
@@ -779,35 +782,40 @@ def _progress(config: RunnableConfig, step: str, status: str, detail: str = "") 
         on_step(step, status, detail)
 
 
+def _on(worker: str) -> str:
+    return f"worker {worker[:6]}"
+
+
 def market_node(state: AgentState, config: RunnableConfig) -> AgentState:
     _progress(config, "market", "running")
-    result = consensus_agent(state)
+    result, worker = run_agent("market", state)
     if result["stock_info"]["price"] is None:
         # ValueError is not retried: the ticker simply doesn't exist
         raise ValueError(f"No market data found for {state['ticker']}")
-    _progress(config, "market", "done", result["stock_info"]["name"])
+    _progress(config, "market", "done", f"{result['stock_info']['name']} · {_on(worker)}")
     return result
 
 
 def news_node(state: AgentState, config: RunnableConfig) -> AgentState:
     _progress(config, "news", "running")
-    result = scraper_agent(state)
+    result, worker = run_agent("news", state)
     publishers = {a["source"] for a in result["articles"]}
-    _progress(config, "news", "done", f"{len(result['articles'])} articles from {len(publishers)} publishers")
+    _progress(config, "news", "done", f"{len(result['articles'])} articles from {len(publishers)} publishers · {_on(worker)}")
     return result
 
 
 def peers_node(state: AgentState, config: RunnableConfig) -> AgentState:
     _progress(config, "peers", "running")
-    result = peers_agent(state)
-    _progress(config, "peers", "done", ", ".join(p["ticker"] for p in result["peers"]["companies"]))
+    result, worker = run_agent("peers", state)
+    tickers = ", ".join(p["ticker"] for p in result["peers"]["companies"])
+    _progress(config, "peers", "done", f"{tickers} · {_on(worker)}")
     return result
 
 
 def report_node(state: AgentState, config: RunnableConfig) -> AgentState:
     _progress(config, "brief", "running")
-    result = report_agent(state)
-    _progress(config, "brief", "done")
+    result, worker = run_agent("report", state)
+    _progress(config, "brief", "done", _on(worker))
     return result
 
 
@@ -841,6 +849,7 @@ def run_pipeline(ticker: str, on_step: Optional[Callable[[str, str, str], None]]
     print(f"AlphaSignal Pipeline — {ticker}")
     print(f"{'='*50}")
 
+    ensure_agents_running()
     state = agent_graph.invoke({"ticker": ticker}, config={"configurable": {"on_step": on_step}})
 
     return {
